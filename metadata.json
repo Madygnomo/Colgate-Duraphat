@@ -1,0 +1,6 @@
+{
+  "name": "Colgate Duraphat — Barniz de Flúor 3D BTL Experience",
+  "description": "Interactive 3D medical activation and BTL tablet experience for Colgate Duraphat 22,600 ppm F fluoride varnish with automated multi-angle camera choreography and touch-drag brush protection.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

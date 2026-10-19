@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   CLINICAL_FDI_CATALOG,
-  TARGETS_PER_SECTOR,
+  type GameSessionState,
   applyBrushScrubToTooth,
   classifySectorByBoundingBoxCenter,
   createInitialGameSession,
+  evaluateDirectionalBrushStroke,
   formatLedCountdown,
   getSectorForFdiNumber,
   getSectorProgress,
@@ -34,6 +35,7 @@ test('FDI tooth numbering maps correctly to FRONT, LEFT, and RIGHT sectors', () 
 test('Mesh name parser and bounding-box fallback classify external GLB teeth reliably', () => {
   assert.equal(parseFdiNumberFromMeshName('tooth_11'), 11);
   assert.equal(parseFdiNumberFromMeshName('Tooth_26_Crown'), 26);
+  assert.equal(parseFdiNumberFromMeshName('Tooth_38_Lower_L_Molar3'), 38);
   assert.equal(parseFdiNumberFromMeshName('diente-44'), 44);
   assert.equal(parseFdiNumberFromMeshName('Gum_Upper'), null);
 
@@ -42,7 +44,7 @@ test('Mesh name parser and bounding-box fallback classify external GLB teeth rel
   assert.equal(classifySectorByBoundingBoxCenter(-1.6, -0.2), 'RIGHT');
 });
 
-test('Initial game session spawns batch of 4 spots in starting sector with 28 total teeth across sectors', () => {
+test('Initial game session spawns batch of 4 spots in starting sector with 4 distinct directional arrows', () => {
   let seed = 0.42;
   const deterministicRng = () => {
     seed = (seed * 9301 + 49297) % 233280;
@@ -62,11 +64,33 @@ test('Initial game session spawns batch of 4 spots in starting sector with 28 to
   assert.equal(rightProgress.total, 8);
   assert.equal(frontProgress.shielded, 0);
 
-  // Active spots in FRONT initially is exactly 4
+  // Active spots in FRONT initially is exactly 4 with all 4 directions represented
   const activeFrontSpots = Object.values(session.teeth).filter(
     (t) => t.sector === 'FRONT' && t.needsVarnish && !t.shielded,
   );
   assert.equal(activeFrontSpots.length, 4);
+  const dirs = new Set(activeFrontSpots.map((t) => t.requiredDirection));
+  assert.equal(dirs.size, 4);
+});
+
+test('evaluateDirectionalBrushStroke validates UP, DOWN, LEFT, and RIGHT finger movements accurately', () => {
+  // UP requires negative dy in screen coordinates
+  assert.equal(evaluateDirectionalBrushStroke('UP', 0, -18).isAligned, true);
+  assert.equal(evaluateDirectionalBrushStroke('UP', 4, -15).isAligned, true);
+  assert.equal(evaluateDirectionalBrushStroke('UP', 0, 18).isAligned, false);
+  assert.equal(evaluateDirectionalBrushStroke('UP', 18, 0).isAligned, false);
+
+  // DOWN requires positive dy
+  assert.equal(evaluateDirectionalBrushStroke('DOWN', 0, 18).isAligned, true);
+  assert.equal(evaluateDirectionalBrushStroke('DOWN', 0, -18).isAligned, false);
+
+  // LEFT requires negative dx
+  assert.equal(evaluateDirectionalBrushStroke('LEFT', -20, 2).isAligned, true);
+  assert.equal(evaluateDirectionalBrushStroke('LEFT', 20, 0).isAligned, false);
+
+  // RIGHT requires positive dx
+  assert.equal(evaluateDirectionalBrushStroke('RIGHT', 20, -2).isAligned, true);
+  assert.equal(evaluateDirectionalBrushStroke('RIGHT', -20, 0).isAligned, false);
 });
 
 test('Multi-stroke scrub cleans batches of 4 and auto-advances FRONT -> LEFT -> RIGHT -> VICTORY across all 28 teeth', () => {
@@ -126,7 +150,10 @@ test('Countdown timer formats as 00:45 / 00:30 and triggers timeout when reachin
   assert.equal(formatLedCountdown(9.2), '00:10');
   assert.equal(formatLedCountdown(0), '00:00');
 
-  let session = { ...createInitialGameSession(0, Math.random, 30), status: 'playing' as const };
+  let session: GameSessionState = {
+    ...createInitialGameSession(0, Math.random, 30),
+    status: 'playing',
+  };
   session = tickGameTimer(session, 12.5);
   assert.equal(session.timeRemainingSec, 17.5);
   assert.equal(session.status, 'playing');

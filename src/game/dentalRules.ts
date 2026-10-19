@@ -6,6 +6,15 @@ export type GameOutcome = 'none' | 'victory' | 'timeout';
 
 export type ToothArchetype = 'incisor' | 'canine' | 'premolar' | 'molar';
 
+export type BrushDirection = 'UP' | 'DOWN' | 'LEFT' | 'RIGHT';
+
+export const BRUSH_DIRECTIONS: readonly BrushDirection[] = [
+  'UP',
+  'DOWN',
+  'LEFT',
+  'RIGHT',
+] as const;
+
 export interface ToothMetadata {
   fdiId: string;
   fdiNumber: number;
@@ -23,6 +32,7 @@ export interface ToothRuntimeState {
   needsVarnish: boolean;
   coverage: number;
   shielded: boolean;
+  requiredDirection: BrushDirection;
 }
 
 export interface CameraRigPreset {
@@ -62,41 +72,41 @@ export const CAMERA_PRESETS: Record<DentalSector | 'ATTRACT' | 'VICTORY', Camera
     sector: 'FRONT',
     labelEs: 'Vista Frontal',
     subtitleEs: 'Arcada Dental Completa',
-    position: [0, 0.06, 7.84],
-    lookAt: [0, -0.04, 0.3],
-    fov: 32,
+    position: [0, 0.05, 9.6],
+    lookAt: [0, -0.02, 0.25],
+    fov: 30,
   },
   FRONT: {
     sector: 'FRONT',
     labelEs: 'Sector Frontal',
     subtitleEs: 'Incisivos y Caninos Anteriores',
-    position: [0, 0.06, 7.72],
-    lookAt: [0, -0.04, 0.35],
-    fov: 32,
+    position: [0, 0.05, 9.45],
+    lookAt: [0, -0.02, 0.3],
+    fov: 30,
   },
   LEFT: {
     sector: 'LEFT',
     labelEs: 'Sector Lateral Izquierdo',
     subtitleEs: 'Premolares y Molares (Cuadrantes 2 y 3)',
-    position: [6.05, 0.2, 4.84],
-    lookAt: [1.15, -0.04, 0.05],
-    fov: 32,
+    position: [7.35, 0.18, 5.95],
+    lookAt: [0.85, -0.02, 0.05],
+    fov: 30,
   },
   RIGHT: {
     sector: 'RIGHT',
     labelEs: 'Sector Lateral Derecho',
     subtitleEs: 'Premolares y Molares (Cuadrantes 1 y 4)',
-    position: [-6.05, 0.2, 4.84],
-    lookAt: [-1.15, -0.04, 0.05],
-    fov: 32,
+    position: [-7.35, 0.18, 5.95],
+    lookAt: [-0.85, -0.02, 0.05],
+    fov: 30,
   },
   VICTORY: {
     sector: 'FRONT',
     labelEs: 'Protección Duraphat 100%',
     subtitleEs: 'Armadura Fluorada Completa (22,600 ppm F)',
-    position: [0, 0.28, 8.03],
-    lookAt: [0, -0.02, 0.3],
-    fov: 33,
+    position: [0, 0.25, 9.8],
+    lookAt: [0, -0.02, 0.25],
+    fov: 31,
   },
 };
 
@@ -191,6 +201,57 @@ export const CLINICAL_FDI_CATALOG: readonly ToothMetadata[] = buildClinicalFdiCa
 
 export const SPOTS_PER_BATCH = 4;
 
+/**
+ * Evaluates whether a screen-space pointer/finger drag vector (dxScreen, dyScreen)
+ * aligns with the tooth's required directional arrow ('UP' | 'DOWN' | 'LEFT' | 'RIGHT').
+ * Note: In browser screen coordinates, +X is RIGHT and -Y is UP.
+ */
+export function evaluateDirectionalBrushStroke(
+  requiredDirection: BrushDirection,
+  dxScreen: number,
+  dyScreen: number,
+): { isAligned: boolean; alignmentFactor: number } {
+  const dist = Math.hypot(dxScreen, dyScreen);
+  if (dist < 1.2) {
+    return { isAligned: false, alignmentFactor: 0 };
+  }
+
+  const ux = dxScreen / dist;
+  const uy = dyScreen / dist;
+
+  let tx = 0;
+  let ty = 0;
+  switch (requiredDirection) {
+    case 'UP':
+      tx = 0;
+      ty = -1;
+      break;
+    case 'DOWN':
+      tx = 0;
+      ty = 1;
+      break;
+    case 'LEFT':
+      tx = -1;
+      ty = 0;
+      break;
+    case 'RIGHT':
+      tx = 1;
+      ty = 0;
+      break;
+  }
+
+  const dot = ux * tx + uy * ty;
+  // Accept strokes within ~68 degrees (cos(68°) ≈ 0.37) of the arrow direction
+  if (dot >= 0.36) {
+    return {
+      isAligned: true,
+      alignmentFactor: Math.min(1.35, 0.72 + dot * 0.63),
+    };
+  }
+
+  return { isAligned: false, alignmentFactor: 0 };
+}
+
 export function activateNextSectorBatch(
   teeth: Record<string, ToothRuntimeState>,
   sector: DentalSector,
@@ -203,41 +264,58 @@ export function activateNextSectorBatch(
   );
   if (unshieldedInSector.length === 0) return nextTeeth;
 
-  let chosen: ToothRuntimeState[] = [];
-  const anyShieldedInFront = Object.values(nextTeeth).some(
-    (t) => t.sector === 'FRONT' && t.shielded,
-  );
-  if (sector === 'FRONT' && !anyShieldedInFront) {
-    const preferredIds = ['tooth_21', 'tooth_42', 'tooth_41', 'tooth_31'];
-    const matched = preferredIds
-      .map((id) => unshieldedInSector.find((t) => t.fdiId === id))
-      .filter((t): t is ToothRuntimeState => Boolean(t));
-    if (matched.length === 4) {
-      chosen = matched;
-    }
+  const shuffled = [...unshieldedInSector];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const tmp = shuffled[i];
+    shuffled[i] = shuffled[j];
+    shuffled[j] = tmp;
+  }
+  const chosen = shuffled.slice(0, Math.min(batchSize, shuffled.length));
+
+  // Assign a varied permutation of the 4 directional arrows across the 4 spots in the batch
+  const dirPool: BrushDirection[] = [...BRUSH_DIRECTIONS];
+  for (let i = dirPool.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const tmp = dirPool[i];
+    dirPool[i] = dirPool[j];
+    dirPool[j] = tmp;
   }
 
-  if (chosen.length === 0) {
-    const shuffled = [...unshieldedInSector];
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(rng() * (i + 1));
-      const tmp = shuffled[i];
-      shuffled[i] = shuffled[j];
-      shuffled[j] = tmp;
-    }
-    chosen = shuffled.slice(0, Math.min(batchSize, shuffled.length));
-  }
-
-  for (const t of chosen) {
+  chosen.forEach((t, idx) => {
     nextTeeth[t.fdiId] = {
       ...t,
       needsVarnish: true,
       coverage: 0,
       shielded: false,
+      requiredDirection: dirPool[idx % dirPool.length],
     };
-  }
+  });
 
   return nextTeeth;
+}
+
+export function switchActiveSector(
+  session: GameSessionState,
+  newSector: DentalSector,
+  rng: () => number = Math.random,
+): GameSessionState {
+  if (session.status !== 'playing' || session.activeSector === newSector) {
+    return session;
+  }
+  let nextTeeth = { ...session.teeth };
+  const unshieldedInNewSector = Object.values(nextTeeth).filter(
+    (t) => t.sector === newSector && !t.shielded,
+  );
+  const activeInNewSector = unshieldedInNewSector.filter((t) => t.needsVarnish);
+  if (activeInNewSector.length === 0 && unshieldedInNewSector.length > 0) {
+    nextTeeth = activateNextSectorBatch(nextTeeth, newSector, SPOTS_PER_BATCH, rng);
+  }
+  return {
+    ...session,
+    activeSector: newSector,
+    teeth: nextTeeth,
+  };
 }
 
 export function createInitialTeethState(
@@ -254,6 +332,7 @@ export function createInitialTeethState(
       needsVarnish: false,
       coverage: 0,
       shielded: false,
+      requiredDirection: 'UP',
     };
   }
 

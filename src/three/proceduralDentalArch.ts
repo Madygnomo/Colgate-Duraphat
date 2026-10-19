@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import {
   CLINICAL_FDI_CATALOG,
+  type BrushDirection,
   type DentalSector,
   type ToothArchetype,
   type ToothMetadata,
@@ -19,6 +20,7 @@ export interface ToothVisualNode {
   crownMesh: THREE.Mesh;
   plaqueMesh: THREE.Mesh;
   shieldMesh: THREE.Mesh;
+  arrowMesh: THREE.Mesh;
   surfaceCenterWorld: THREE.Vector3;
   surfaceNormalWorld: THREE.Vector3;
 }
@@ -396,16 +398,16 @@ function createToothPlaqueShaderMaterial(seed: number): THREE.ShaderMaterial {
 
         float wobbleX = sin(ny * 4.0 + uSeed) * 0.10 + cos(nx * 5.2 - uSeed) * 0.06;
         float wobbleY = cos(nx * 3.6 + uSeed * 1.3) * 0.09;
-        vec2 p = vec2((nx + wobbleX) * 1.62, (ny + 0.04 + wobbleY) * 1.50);
+        vec2 p = vec2((nx + wobbleX) * 1.24, (ny + 0.02 + wobbleY) * 1.18);
         float dist = length(p);
 
-        float outerStain = smoothstep(0.88, 0.24, dist);
-        float innerCore = smoothstep(0.54, 0.10, dist);
-        float alpha = outerStain * labialMask * uOpacity * 0.68;
+        float outerStain = smoothstep(0.92, 0.22, dist);
+        float innerCore = smoothstep(0.58, 0.12, dist);
+        float alpha = outerStain * labialMask * uOpacity * 0.78;
         if (alpha <= 0.01) discard;
 
-        vec3 edgeColor = vec3(0.92, 0.84, 0.55);
-        vec3 coreColor = vec3(0.86, 0.73, 0.38);
+        vec3 edgeColor = vec3(0.94, 0.84, 0.48);
+        vec3 coreColor = vec3(0.88, 0.71, 0.28);
         vec3 finalColor = mix(edgeColor, coreColor, innerCore);
 
         gl_FragColor = vec4(finalColor, alpha);
@@ -513,6 +515,112 @@ function createFluorideContourShaderMaterial(): THREE.ShaderMaterial {
     blending: THREE.NormalBlending,
     polygonOffset: true,
     polygonOffsetFactor: -8,
+  });
+}
+
+const DIRECTION_ANGLE_RAD: Record<BrushDirection, number> = {
+  UP: 0,
+  DOWN: Math.PI,
+  LEFT: Math.PI * 0.5,
+  RIGHT: -Math.PI * 0.5,
+};
+
+/**
+ * Custom ShaderMaterial for the Directional Brush Stroke Arrow Indicator on each stained tooth.
+ * Renders a crisp, animated medical-grade vector arrow + chevron sliding in the required stroke direction
+ * (`UP`, `DOWN`, `LEFT`, `RIGHT`) with a radial coverage progress ring.
+ */
+function createDirectionalArrowShaderMaterial(): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uOpacity: { value: 0.0 },
+      uDirectionAngle: { value: 0.0 },
+      uTime: { value: 0.0 },
+      uCoverage: { value: 0.0 },
+    },
+    vertexShader: /* glsl */ `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform float uOpacity;
+      uniform float uDirectionAngle;
+      uniform float uTime;
+      uniform float uCoverage;
+      varying vec2 vUv;
+
+      float sdSegment(in vec2 p, in vec2 a, in vec2 b) {
+        vec2 pa = p - a, ba = b - a;
+        float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+        return length(pa - ba * h);
+      }
+
+      void main() {
+        if (uOpacity <= 0.01) discard;
+
+        vec2 p = (vUv - 0.5) * 2.0;
+        float r = length(p);
+        if (r > 0.92) discard;
+
+        // Rotate into canonical arrow space where +Y is the required brush stroke direction
+        float c = cos(-uDirectionAngle);
+        float s = sin(-uDirectionAngle);
+        vec2 q = vec2(c * p.x - s * p.y, s * p.x + c * p.y);
+
+        // Smooth animated sliding pulse along +Y (the direction the user must move the brush)
+        float cycle = fract(uTime * 1.15);
+        float slideY = (cycle - 0.5) * 0.26;
+        vec2 qa = vec2(q.x, q.y - slideY);
+
+        // Primary Arrow Shaft + Chevron Head pointing toward +Y
+        float dShaft = sdSegment(qa, vec2(0.0, -0.34), vec2(0.0, 0.28));
+        float dHeadL = sdSegment(qa, vec2(0.0, 0.34), vec2(-0.28, 0.04));
+        float dHeadR = sdSegment(qa, vec2(0.0, 0.34), vec2(0.28, 0.04));
+        float dArrow = min(dShaft, min(dHeadL, dHeadR));
+
+        // Secondary trailing chevron for clear directional flow
+        float dTrailL = sdSegment(qa, vec2(0.0, -0.06), vec2(-0.22, -0.28));
+        float dTrailR = sdSegment(qa, vec2(0.0, -0.06), vec2(0.22, -0.28));
+        float dTrail = min(dTrailL, dTrailR);
+
+        // Translucent frosted badge backdrop & outer coverage progress ring so yellow stain remains visible
+        float badgeMask = smoothstep(0.82, 0.72, r);
+        float ringDist = abs(r - 0.78);
+        float ringMask = smoothstep(0.068, 0.016, ringDist);
+
+        float angle01 = fract((atan(p.x, p.y) / 6.2831853) + 1.0);
+        float covArc = step(angle01, clamp(uCoverage, 0.06, 1.0));
+
+        float arrowCore = smoothstep(0.098, 0.032, dArrow);
+        float arrowGlow = smoothstep(0.22, 0.04, dArrow);
+        float trailCore = smoothstep(0.078, 0.025, dTrail) * (1.0 - cycle * 0.5);
+
+        vec3 badgeBg = mix(vec3(0.26, 0.10, 0.52), vec3(0.46, 0.18, 0.88), uCoverage);
+        vec3 ringColor = mix(vec3(0.82, 0.70, 1.0), vec3(0.32, 0.98, 0.74), covArc);
+        vec3 strokeColor = vec3(1.0, 1.0, 1.0);
+        vec3 glowColor = vec3(0.76, 0.45, 1.0);
+
+        vec3 col = badgeBg;
+        col = mix(col, glowColor, arrowGlow * 0.65);
+        col = mix(col, ringColor, ringMask * (0.55 + 0.45 * covArc));
+        col = mix(col, strokeColor, clamp(arrowCore + trailCore * 0.78, 0.0, 1.0));
+
+        float alpha = clamp(
+          (badgeMask * 0.42 + ringMask * 0.90 + arrowGlow * 0.52 + arrowCore * 0.98 + trailCore * 0.76) * uOpacity,
+          0.0,
+          1.0
+        );
+        if (alpha <= 0.01) discard;
+
+        gl_FragColor = vec4(col, alpha);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
   });
 }
 
@@ -692,21 +800,36 @@ function buildToothNodeFromGeometry(
   plaqueMesh.renderOrder = 2;
   parentGroup.add(plaqueMesh);
 
-  // 3. Signature Neon-Violet & White Fluoride U-Contour Shell ("Película Fluorada")
-  // Displaced slightly outward toward the camera so the cervical U-arch sits cleanly on top of the gumline collar
-  const shieldGeo = createDisplacedShellGeometry(toothGeo, 0.007, outwardNormal, 0.022);
+  // 3. Legacy contour shell disabled — replaced by PBR metalness/roughness varnish glaze + mini-particles
+  const shieldGeo = new THREE.BufferGeometry();
   disposableGeometries.push(shieldGeo);
   const shieldMat = createFluorideContourShaderMaterial();
   disposableMaterials.push(shieldMat);
 
   const shieldMesh = new THREE.Mesh(shieldGeo, shieldMat);
-  shieldMesh.visible = true;
-  shieldMesh.renderOrder = 4;
+  shieldMesh.visible = false;
   parentGroup.add(shieldMesh);
 
   const surfaceCenterWorld = crownCenter
     .clone()
-    .addScaledVector(outwardNormal, Math.min(0.24, halfD * 0.82));
+    .addScaledVector(outwardNormal, Math.min(0.20, halfD * 0.82));
+
+  // 4. Directional Brush Stroke Arrow Indicator floating cleanly on the labial/buccal crown surface
+  const arrowGeo = new THREE.PlaneGeometry(0.25, 0.25);
+  disposableGeometries.push(arrowGeo);
+  const arrowMat = createDirectionalArrowShaderMaterial();
+  disposableMaterials.push(arrowMat);
+
+  const arrowMesh = new THREE.Mesh(arrowGeo, arrowMat);
+  arrowMesh.position.copy(crownCenter).addScaledVector(outwardNormal, halfD + 0.048);
+  arrowMesh.lookAt(
+    arrowMesh.position.x + outwardNormal.x,
+    arrowMesh.position.y + outwardNormal.y,
+    arrowMesh.position.z + outwardNormal.z,
+  );
+  arrowMesh.visible = false;
+  arrowMesh.renderOrder = 8;
+  parentGroup.add(arrowMesh);
 
   return {
     fdiId,
@@ -717,6 +840,7 @@ function buildToothNodeFromGeometry(
     crownMesh,
     plaqueMesh,
     shieldMesh,
+    arrowMesh,
     surfaceCenterWorld,
     surfaceNormalWorld: outwardNormal,
   };
@@ -727,11 +851,11 @@ function buildToothNodeFromGeometry(
  * so zero triangles are ever stretched or inverted.
  */
 function closeGumOcclusionGap(gumGeo: THREE.BufferGeometry, jawOffsetY: number): void {
+  if (Math.abs(jawOffsetY) < 1e-5) return;
   const pos = gumGeo.attributes.position;
   if (!pos) return;
   for (let i = 0; i < pos.count; i++) {
     const y = pos.getY(i);
-    // In normalized space, upper gum has y >= 0.25 and lower gum has y <= -0.10 (zero vertices in between)
     if (y >= 0.08) {
       pos.setY(i, y - jawOffsetY);
     } else {
@@ -759,13 +883,33 @@ export function bindExternalGlbDentalArch(gltfScene: THREE.Group): BuiltDentalAr
   });
 
   const rawBox = new THREE.Box3();
+  let frontIncisorMesh: THREE.Mesh | null = null;
+  let gumMeshCount = 0;
+
   for (const m of rawMeshes) {
     rawBox.expandByObject(m);
+    const mName = (m.name || '').toLowerCase();
+    if (mName.includes('gum') || mName.includes('gingiv') || mName.includes('encia')) {
+      gumMeshCount++;
+    }
+    const fdi = parseFdiNumberFromMeshName(m.name);
+    if (fdi === 11 || fdi === 21) {
+      frontIncisorMesh = m;
+    }
   }
   const rawSize = new THREE.Vector3();
   rawBox.getSize(rawSize);
 
-  const rotateYMinus90 = rawSize.z > rawSize.x * 1.08;
+  // Determine if the model needs a -90 deg Y rotation:
+  // If explicit front incisors (Tooth_11 / Tooth_21) exist and already sit at +Z, do NOT rotate!
+  let rotateYMinus90 = rawSize.z > rawSize.x * 1.08;
+  if (frontIncisorMesh) {
+    const incBox = new THREE.Box3().setFromObject(frontIncisorMesh);
+    const incCenter = new THREE.Vector3();
+    incBox.getCenter(incCenter);
+    rotateYMinus90 = Math.abs(incCenter.x) > Math.abs(incCenter.z);
+  }
+
   const rotMatrix = new THREE.Matrix4();
   if (rotateYMinus90) {
     rotMatrix.makeRotationY(-Math.PI / 2);
@@ -776,7 +920,8 @@ export function bindExternalGlbDentalArch(gltfScene: THREE.Group): BuiltDentalAr
   for (const m of rawMeshes) {
     const pos = m.geometry.attributes.position;
     if (!pos) continue;
-    for (let i = 0; i < pos.count; i += 4) {
+    const step = Math.max(1, Math.floor(pos.count / 200));
+    for (let i = 0; i < pos.count; i += step) {
       tempV.fromBufferAttribute(pos, i).applyMatrix4(m.matrixWorld).applyMatrix4(rotMatrix);
       rotBox.expandByPoint(tempV);
     }
@@ -787,15 +932,16 @@ export function bindExternalGlbDentalArch(gltfScene: THREE.Group): BuiltDentalAr
   rotBox.getCenter(rotCenter);
   rotBox.getSize(rotSize);
 
-  const maxDim = Math.max(rotSize.x, rotSize.y, rotSize.z) || 1;
-  const scaleFactor = 5.15 / maxDim;
+  const widthDim = rotSize.x > 0.1 ? rotSize.x : Math.max(rotSize.x, rotSize.y, rotSize.z) || 1;
+  const scaleFactor = 3.95 / widthDim;
 
   const normMatrix = new THREE.Matrix4()
     .makeScale(scaleFactor, scaleFactor, scaleFactor)
     .multiply(new THREE.Matrix4().makeTranslation(-rotCenter.x, -rotCenter.y, -rotCenter.z))
     .multiply(rotMatrix);
 
-  const JAW_OCCLUSION_OFFSET_Y = 0.048;
+  // In mouth_model_optimized.glb (gumMeshCount >= 2), upper and lower incisors are already in closed occlusion at y=0
+  const JAW_OCCLUSION_OFFSET_Y = gumMeshCount >= 2 ? 0.0 : 0.048;
 
   const extractedUpperIslands: {
     geo: THREE.BufferGeometry;
@@ -812,8 +958,9 @@ export function bindExternalGlbDentalArch(gltfScene: THREE.Group): BuiltDentalAr
     explicitFdi: number | null;
   }[] = [];
 
-  let combinedGumPositions: Float32Array | null = null;
+  const gumPositionChunks: Float32Array[] = [];
 
+  // Pass 1: Process all Gingiva (Gum) meshes first so combinedGumPositions includes both Upper & Lower gums
   for (const mesh of rawMeshes) {
     const meshName = (mesh.name || '').toLowerCase();
     const mat = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
@@ -826,43 +973,73 @@ export function bindExternalGlbDentalArch(gltfScene: THREE.Group): BuiltDentalAr
       matName.includes('gingiv') ||
       meshName.includes('encia');
 
+    if (!isGum) continue;
+
     const worldToNorm = normMatrix.clone().multiply(mesh.matrixWorld);
+    const gumGeo = mesh.geometry.clone();
+    gumGeo.applyMatrix4(worldToNorm);
+    closeGumOcclusionGap(gumGeo, JAW_OCCLUSION_OFFSET_Y);
+    disposableGeometries.push(gumGeo);
 
-    if (isGum) {
-      const gumGeo = mesh.geometry.clone();
-      gumGeo.applyMatrix4(worldToNorm);
-      closeGumOcclusionGap(gumGeo, JAW_OCCLUSION_OFFSET_Y);
-      disposableGeometries.push(gumGeo);
-
-      if (gumGeo.attributes.position) {
-        combinedGumPositions = gumGeo.attributes.position.array as Float32Array;
-      }
-
-      const stdMat = mat as THREE.MeshStandardMaterial | undefined;
-      const gumMat = new THREE.MeshPhysicalMaterial({
-        map: stdMat?.map ?? null,
-        bumpMap: stdMat?.normalMap ?? null,
-        bumpScale: 0.006,
-        color: stdMat?.map ? new THREE.Color('#ffe0e6') : new THREE.Color('#f4798e'),
-        roughness: 0.32,
-        metalness: 0.0,
-        clearcoat: 0.55,
-        clearcoatRoughness: 0.22,
-        emissive: new THREE.Color('#66162c'),
-        emissiveIntensity: 0.16,
-      });
-      disposableMaterials.push(gumMat);
-
-      const gumMesh = new THREE.Mesh(gumGeo, gumMat);
-      gumMesh.name = 'DuraphatSculptedGingiva';
-      gumMesh.castShadow = true;
-      gumMesh.receiveShadow = true;
-      archGroup.add(gumMesh);
-      continue;
+    if (gumGeo.attributes.position) {
+      gumPositionChunks.push(gumGeo.attributes.position.array as Float32Array);
     }
 
+    const stdMat = mat as THREE.MeshStandardMaterial | undefined;
+    const gumMat = new THREE.MeshPhysicalMaterial({
+      map: stdMat?.map ?? null,
+      bumpMap: stdMat?.normalMap ?? null,
+      bumpScale: 0.006,
+      color: stdMat?.map ? new THREE.Color('#ffe0e6') : new THREE.Color('#f4798e'),
+      roughness: 0.32,
+      metalness: 0.0,
+      clearcoat: 0.55,
+      clearcoatRoughness: 0.22,
+      emissive: new THREE.Color('#66162c'),
+      emissiveIntensity: 0.16,
+    });
+    disposableMaterials.push(gumMat);
+
+    const gumMesh = new THREE.Mesh(gumGeo, gumMat);
+    gumMesh.name = mesh.name || 'DuraphatSculptedGingiva';
+    gumMesh.castShadow = true;
+    gumMesh.receiveShadow = true;
+    archGroup.add(gumMesh);
+  }
+
+  let combinedGumPositions: Float32Array | null = null;
+  if (gumPositionChunks.length === 1) {
+    combinedGumPositions = gumPositionChunks[0];
+  } else if (gumPositionChunks.length > 1) {
+    const totalLen = gumPositionChunks.reduce((acc, arr) => acc + arr.length, 0);
+    combinedGumPositions = new Float32Array(totalLen);
+    let offset = 0;
+    for (const chunk of gumPositionChunks) {
+      combinedGumPositions.set(chunk, offset);
+      offset += chunk.length;
+    }
+  }
+
+  // Pass 2: Process all Tooth meshes
+  for (const mesh of rawMeshes) {
+    const meshName = (mesh.name || '').toLowerCase();
+    const mat = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+    const matName = (mat?.name || '').toLowerCase();
+
+    const isGum =
+      meshName.includes('gum') ||
+      matName.includes('gum') ||
+      meshName.includes('gingiv') ||
+      matName.includes('gingiv') ||
+      meshName.includes('encia');
+
+    if (isGum) continue;
+
+    const worldToNorm = normMatrix.clone().multiply(mesh.matrixWorld);
     const explicitFdi = parseFdiNumberFromMeshName(mesh.name);
-    const islands = splitBufferGeometryIntoToothIslands(mesh.geometry, 250);
+    const islands = explicitFdi
+      ? [mesh.geometry.clone()]
+      : splitBufferGeometryIntoToothIslands(mesh.geometry, 250);
 
     for (const islGeo of islands) {
       islGeo.applyMatrix4(worldToNorm);
@@ -870,11 +1047,12 @@ export function bindExternalGlbDentalArch(gltfScene: THREE.Group): BuiltDentalAr
 
       const cBefore = new THREE.Vector3();
       islGeo.boundingBox!.getCenter(cBefore);
-      const isUpperIsland = cBefore.y >= 0;
+      const isUpperIsland = explicitFdi ? explicitFdi < 30 : cBefore.y >= 0;
 
-      // Rigid-body vertical translation per tooth island (never tears triangles at y=0!)
-      islGeo.translate(0, isUpperIsland ? -JAW_OCCLUSION_OFFSET_Y : JAW_OCCLUSION_OFFSET_Y, 0);
-      islGeo.computeBoundingBox();
+      if (Math.abs(JAW_OCCLUSION_OFFSET_Y) > 1e-5) {
+        islGeo.translate(0, isUpperIsland ? -JAW_OCCLUSION_OFFSET_Y : JAW_OCCLUSION_OFFSET_Y, 0);
+        islGeo.computeBoundingBox();
+      }
       disposableGeometries.push(islGeo);
 
       const c = new THREE.Vector3();
@@ -948,7 +1126,7 @@ export function bindExternalGlbDentalArch(gltfScene: THREE.Group): BuiltDentalAr
     interactables.push(node.crownMesh);
   });
 
-  const oralCavityGeo = new THREE.CylinderGeometry(1.75, 1.75, 1.05, 32, 1, false);
+  const oralCavityGeo = new THREE.CylinderGeometry(1.34, 1.34, 0.82, 32, 1, false);
   const oralCavityMat = new THREE.MeshStandardMaterial({
     color: new THREE.Color('#9e3454'),
     roughness: 0.75,
@@ -958,7 +1136,7 @@ export function bindExternalGlbDentalArch(gltfScene: THREE.Group): BuiltDentalAr
     side: THREE.DoubleSide,
   });
   const oralCavityMesh = new THREE.Mesh(oralCavityGeo, oralCavityMat);
-  oralCavityMesh.position.set(0, 0, -0.48);
+  oralCavityMesh.position.set(0, 0, -0.36);
   oralCavityMesh.scale.set(1.04, 1, 0.84);
   archGroup.add(oralCavityMesh);
   disposableGeometries.push(oralCavityGeo);
@@ -1135,12 +1313,27 @@ export function syncTeethVisualState(
   activeSector: DentalSector,
   elapsedSeconds: number,
   activeBrushedFdiId?: string | null,
+  cameraQuaternion?: THREE.Quaternion,
+  isPlaying = false,
 ): void {
   for (const [fdiId, node] of toothNodes.entries()) {
-    const tState = teethState[fdiId];
+    const fallbackId =
+      fdiId === 'tooth_18'
+        ? 'tooth_17'
+        : fdiId === 'tooth_28'
+          ? 'tooth_27'
+          : fdiId === 'tooth_38'
+            ? 'tooth_37'
+            : fdiId === 'tooth_48'
+              ? 'tooth_47'
+              : fdiId;
+
+    const isWisdomMirror = fdiId !== fallbackId;
+    const tState = teethState[fdiId] ?? teethState[fallbackId];
     const crownMat = node.crownMesh.material as THREE.MeshPhysicalMaterial;
     const plaqueMat = node.plaqueMesh.material as THREE.ShaderMaterial;
     const shieldMat = node.shieldMesh.material as THREE.ShaderMaterial;
+    const arrowMat = node.arrowMesh.material as THREE.ShaderMaterial;
 
     if (!tState) continue;
 
@@ -1149,10 +1342,10 @@ export function syncTeethVisualState(
     const isActivelyBrushed = activeBrushedFdiId === fdiId;
 
     // 1. Organic Labial Plaque Stain on unshielded target teeth in the active sector
-    if (tState.needsVarnish && !tState.shielded && inActiveSector) {
+    if (!isWisdomMirror && tState.needsVarnish && !tState.shielded && inActiveSector) {
       node.plaqueMesh.visible = true;
-      const fadeOut = isActivelyBrushed ? Math.max(0, 0.2 - cov) : 1.0 - cov * 0.95;
-      plaqueMat.uniforms.uOpacity.value = Math.max(0, fadeOut);
+      const fadeOut = Math.pow(Math.max(0, 1.0 - cov), 1.25);
+      plaqueMat.uniforms.uOpacity.value = fadeOut;
       crownMat.color.lerpColors(ENAMEL_PLAQUE_TINT, ENAMEL_BASE_COLOR, cov);
     } else {
       node.plaqueMesh.visible = false;
@@ -1160,28 +1353,150 @@ export function syncTeethVisualState(
       crownMat.color.copy(ENAMEL_BASE_COLOR);
     }
 
-    // 2. Signature Neon-Violet & White U-shaped Fluoride Shield Contour ("Película Fluorada")
-    const pulse = 0.95 + 0.05 * Math.sin(elapsedSeconds * 3.0 + node.fdiNumber * 0.6);
-
-    if (isActivelyBrushed) {
-      node.shieldMesh.visible = true;
-      shieldMat.uniforms.uIntensity.value = 1.0 * pulse;
-      shieldMat.uniforms.uBrushBoost.value = 1.0;
-    } else if (tState.shielded) {
-      node.shieldMesh.visible = true;
-      shieldMat.uniforms.uIntensity.value = 0.94 * pulse;
-      shieldMat.uniforms.uBrushBoost.value = 0.0;
-    } else if (tState.needsVarnish && cov > 0.02) {
-      node.shieldMesh.visible = true;
-      shieldMat.uniforms.uIntensity.value = (0.38 + cov * 0.62) * pulse;
-      shieldMat.uniforms.uBrushBoost.value = 0.65;
+    // 2. Directional Arrow Guide on active stained teeth during gameplay
+    if (!isWisdomMirror && isPlaying && tState.needsVarnish && !tState.shielded && inActiveSector) {
+      node.arrowMesh.visible = true;
+      if (cameraQuaternion) {
+        node.arrowMesh.quaternion.copy(cameraQuaternion);
+      }
+      arrowMat.uniforms.uOpacity.value = 0.96;
+      arrowMat.uniforms.uDirectionAngle.value =
+        DIRECTION_ANGLE_RAD[tState.requiredDirection] ?? 0;
+      arrowMat.uniforms.uTime.value = elapsedSeconds;
+      arrowMat.uniforms.uCoverage.value = cov;
     } else {
-      // Unshielded plaque-spotted target teeth have NO purple fluoride shield yet until brushed
-      node.shieldMesh.visible = false;
-      shieldMat.uniforms.uIntensity.value = 0.0;
-      shieldMat.uniforms.uBrushBoost.value = 0.0;
+      node.arrowMesh.visible = false;
+      arrowMat.uniforms.uOpacity.value = 0.0;
+    }
+
+    // 3. Aesthetic PBR Fluoride Varnish Material Transformation (metalness, roughness, clearcoat & iridescence)
+    // Purple contour lines are permanently disabled in favor of physical glaze + mini-particles.
+    node.shieldMesh.visible = false;
+    shieldMat.uniforms.uIntensity.value = 0.0;
+
+    const shimmerPulse = 0.5 + 0.5 * Math.sin(elapsedSeconds * 3.4 + node.fdiNumber * 0.65);
+
+    if (tState.shielded) {
+      // 100% Varnished Tooth: Mirror-gloss fluoride glaze with pearlescent metallic sheen
+      crownMat.roughness = 0.035;
+      crownMat.metalness = 0.22;
+      crownMat.clearcoat = 1.0;
+      crownMat.clearcoatRoughness = 0.02;
+      crownMat.reflectivity = 1.0;
+      crownMat.iridescence = 0.65;
+      crownMat.iridescenceIOR = 1.45;
+      crownMat.emissive.set('#6d3fd6');
+      crownMat.emissiveIntensity = 0.12 + shimmerPulse * 0.06;
+    } else if (!isWisdomMirror && tState.needsVarnish && inActiveSector) {
+      // Stained Target Tooth: Transitions from matte/chalky plaque surface to high-gloss metallic glaze as brushed
+      crownMat.roughness = THREE.MathUtils.lerp(0.52, 0.04, cov);
+      crownMat.metalness = THREE.MathUtils.lerp(0.0, 0.22, cov);
+      crownMat.clearcoat = THREE.MathUtils.lerp(0.14, 1.0, cov);
+      crownMat.clearcoatRoughness = THREE.MathUtils.lerp(0.36, 0.02, cov);
+      crownMat.reflectivity = THREE.MathUtils.lerp(0.55, 1.0, cov);
+      crownMat.iridescence = THREE.MathUtils.lerp(0.0, 0.65, cov);
+      crownMat.iridescenceIOR = 1.45;
+      crownMat.emissive.set('#7c3aed');
+      crownMat.emissiveIntensity = isActivelyBrushed ? 0.26 : cov * 0.15;
+    } else {
+      // Clean Natural Enamel
+      crownMat.roughness = 0.20;
+      crownMat.metalness = 0.02;
+      crownMat.clearcoat = 0.82;
+      crownMat.clearcoatRoughness = 0.10;
+      crownMat.reflectivity = 0.90;
+      crownMat.iridescence = 0.0;
+      crownMat.emissive.set('#3b2854');
+      crownMat.emissiveIntensity = 0.05;
     }
   }
+}
+
+/**
+ * Binds the uploaded `brush_applicator_optimized.glb` model into the existing 3D brush group,
+ * normalizing its bristle tip to local (0, 0, 0) and handle along +Z, and applying a two-tone
+ * pearly-white bristle tip + glossy Colgate Red handle vertex shading.
+ */
+export function bindExternalGlbBrush(
+  gltfScene: THREE.Group,
+  targetBrushGroup: THREE.Group,
+): { bristleTipMesh: THREE.Mesh; dispose: () => void } | null {
+  gltfScene.updateMatrixWorld(true);
+  let sourceMesh: THREE.Mesh | null = null;
+  gltfScene.traverse((child) => {
+    if ((child as THREE.Mesh).isMesh && !sourceMesh) {
+      sourceMesh = child as THREE.Mesh;
+    }
+  });
+  if (!sourceMesh) return null;
+
+  const foundMesh = sourceMesh as THREE.Mesh;
+  const geo = foundMesh.geometry.clone();
+  geo.applyMatrix4(foundMesh.matrixWorld);
+  geo.computeBoundingBox();
+  const box = geo.boundingBox!;
+  const midX = (box.min.x + box.max.x) * 0.5;
+  const midZ = (box.min.z + box.max.z) * 0.5;
+  const tipY = box.max.y;
+
+  // Move bristle tip (max.y) to origin (0,0,0) and rotate -90deg around X so handle extends along +Z (z in [0, +3.4])
+  geo.translate(-midX, -tipY, -midZ);
+  geo.rotateX(-Math.PI * 0.5);
+  geo.scale(2.05, 2.05, 2.05);
+  geo.computeBoundingBox();
+  geo.computeVertexNormals();
+
+  // Compute vertex colors: pearly-lavender bristle tuft near z=0..0.32, glossy Colgate Red handle for z>=0.34
+  const pos = geo.attributes.position;
+  const colors = new Float32Array(pos.count * 3);
+  const bristleColor = new THREE.Color('#f7f3ff');
+  const redHandleColor = new THREE.Color('#dc1422');
+  const tmpColor = new THREE.Color();
+
+  for (let i = 0; i < pos.count; i++) {
+    const z = pos.getZ(i);
+    const tHandle = Math.max(0, Math.min(1, (z - 0.28) / 0.10));
+    tmpColor.lerpColors(bristleColor, redHandleColor, tHandle);
+    colors[i * 3] = tmpColor.r;
+    colors[i * 3 + 1] = tmpColor.g;
+    colors[i * 3 + 2] = tmpColor.b;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+  const mat = new THREE.MeshPhysicalMaterial({
+    color: new THREE.Color('#ffffff'),
+    vertexColors: true,
+    roughness: 0.18,
+    metalness: 0.04,
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.06,
+    emissive: new THREE.Color('#5a1430'),
+    emissiveIntensity: 0.2,
+  });
+
+  // Remove procedural mesh children from targetBrushGroup while keeping the contact glow Sprite
+  const toRemove: THREE.Object3D[] = [];
+  for (const child of targetBrushGroup.children) {
+    if ((child as THREE.Mesh).isMesh) {
+      toRemove.push(child);
+    }
+  }
+  for (const child of toRemove) {
+    targetBrushGroup.remove(child);
+  }
+
+  const glbBrushMesh = new THREE.Mesh(geo, mat);
+  glbBrushMesh.name = 'LoadedGlbColgateBrush';
+  glbBrushMesh.castShadow = true;
+  targetBrushGroup.add(glbBrushMesh);
+
+  return {
+    bristleTipMesh: glbBrushMesh,
+    dispose: () => {
+      geo.dispose();
+      mat.dispose();
+    },
+  };
 }
 
 function createBrushGlowTexture(): THREE.CanvasTexture {

@@ -1,26 +1,37 @@
 import React, { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import {
   CAMERA_PRESETS,
   type DentalSector,
   type GameSessionState,
+  evaluateDirectionalBrushStroke,
 } from '../game/dentalRules';
 import {
   type BuiltDentalArch,
+  bindExternalGlbBrush,
   bindExternalGlbDentalArch,
   buildProceduralDentalArch,
   createColgateRedBrush3D,
   syncTeethVisualState,
 } from '../three/proceduralDentalArch';
 
-const DEFAULT_MOUTH_GLB_URL = new URL('../assets/mouth_test.glb', import.meta.url).href;
+const DEFAULT_MOUTH_GLB_URL = new URL(
+  '../assets/models/mouth_model_optimized.glb',
+  import.meta.url,
+).href;
+const FALLBACK_MOUTH_GLB_URL = new URL('../assets/mouth_test.glb', import.meta.url).href;
+const DEFAULT_BRUSH_GLB_URL = new URL(
+  '../assets/models/brush_applicator_optimized.glb',
+  import.meta.url,
+).href;
 
 export interface DentalViewport3DProps {
   session: GameSessionState;
   onScrubTooth: (fdiId: string, coverageDelta: number) => void;
-  customGlbBuffer: ArrayBuffer | null;
+  customGlbBuffer?: ArrayBuffer | null;
   onModelLoaded?: (source: 'PROCEDURAL' | 'GLB', meshCount: number, name?: string) => void;
 }
 
@@ -168,28 +179,43 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
     contactShadowMesh.position.set(0, -1.42, 0.2);
     scene.add(contactShadowMesh);
 
-    // 5. Build Initial Arch & Automatically Load `src/assets/mouth_test.glb`
+    // 5. Build Initial Arch & Automatically Load `mouth_model_optimized.glb` with Draco Decoder
     let currentArch: BuiltDentalArch = buildProceduralDentalArch();
     scene.add(currentArch.archGroup);
     document.body.dataset.modelLoaded = 'procedural';
 
-    const gltfLoader = new GLTFLoader();
+    const dracoLoader = new DRACOLoader();
+    dracoLoader.setDecoderPath('/draco/');
+    dracoLoader.preload();
 
-    // Load default bundled `mouth_test.glb` automatically
+    const gltfLoader = new GLTFLoader();
+    gltfLoader.setDRACOLoader(dracoLoader);
+
+    const applyLoadedMouthScene = (gltfScene: THREE.Group, modelName: string) => {
+      if (isDisposed) return;
+      scene.remove(currentArch.archGroup);
+      currentArch.dispose();
+      currentArch = bindExternalGlbDentalArch(gltfScene);
+      scene.add(currentArch.archGroup);
+      document.body.dataset.modelLoaded = 'glb';
+      onModelLoadedRef.current?.('GLB', currentArch.toothNodes.size, modelName);
+    };
+
     gltfLoader.load(
       DEFAULT_MOUTH_GLB_URL,
       (gltf) => {
-        if (isDisposed) return;
-        scene.remove(currentArch.archGroup);
-        currentArch.dispose();
-        currentArch = bindExternalGlbDentalArch(gltf.scene);
-        scene.add(currentArch.archGroup);
-        document.body.dataset.modelLoaded = 'glb';
-        onModelLoadedRef.current?.('GLB', currentArch.toothNodes.size, 'mouth_test.glb');
+        applyLoadedMouthScene(gltf.scene, 'mouth_model_optimized.glb');
       },
       undefined,
       () => {
-        // Fallback remains procedural if asset load fails
+        gltfLoader.load(
+          FALLBACK_MOUTH_GLB_URL,
+          (gltf) => {
+            applyLoadedMouthScene(gltf.scene, 'mouth_test.glb');
+          },
+          undefined,
+          () => {},
+        );
       },
     );
 
@@ -198,21 +224,38 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
         buffer,
         '',
         (gltf) => {
-          if (isDisposed) return;
-          scene.remove(currentArch.archGroup);
-          currentArch.dispose();
-          currentArch = bindExternalGlbDentalArch(gltf.scene);
-          scene.add(currentArch.archGroup);
-          onModelLoadedRef.current?.('GLB', currentArch.toothNodes.size);
+          applyLoadedMouthScene(gltf.scene, 'custom.glb');
         },
         () => {},
       );
     };
 
-    // 6. Build Articulated 3D Colgate Red Brush (`PINCEL`)
-    const { brushGroup, bristleTipMesh, dispose: disposeBrush } = createColgateRedBrush3D();
+    // 6. Build Articulated 3D Colgate Red Brush & Load `brush_applicator_optimized.glb`
+    const {
+      brushGroup,
+      bristleTipMesh: initialBristleMesh,
+      dispose: disposeProceduralBrush,
+    } = createColgateRedBrush3D();
+    let activeBristleMesh: THREE.Mesh = initialBristleMesh;
+    let disposeGlbBrush: (() => void) | null = null;
+
     brushGroup.position.copy(_brushCurrentPos);
     scene.add(brushGroup);
+
+    gltfLoader.load(
+      DEFAULT_BRUSH_GLB_URL,
+      (gltf) => {
+        if (isDisposed) return;
+        const bound = bindExternalGlbBrush(gltf.scene, brushGroup);
+        if (bound) {
+          activeBristleMesh = bound.bristleTipMesh;
+          disposeGlbBrush = bound.dispose;
+          document.body.dataset.brushLoaded = 'glb';
+        }
+      },
+      undefined,
+      () => {},
+    );
 
     // 7. Fine Micro-Sparkle Particle Ring Buffer (`THREE.InstancedMesh`)
     const particleGeo = new THREE.OctahedronGeometry(0.024, 1);
@@ -280,9 +323,20 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
     let lastRaycastTime = 0;
     let brushActiveUntil = 0;
     let hoveredFdiId: string | null = null;
+    let lockedStrokeFdiId: string | null = null;
+    let lockedStrokeUntil = 0;
     let cameraTrauma = 0;
     let prevShieldedCount = sessionRef.current.shieldedCount;
     let ambientSparkleTimer = 0;
+
+    const resolvePlayableToothId = (rawId: string | undefined | null): string | null => {
+      if (!rawId) return null;
+      if (rawId === 'tooth_18') return 'tooth_17';
+      if (rawId === 'tooth_28') return 'tooth_27';
+      if (rawId === 'tooth_38') return 'tooth_37';
+      if (rawId === 'tooth_48') return 'tooth_47';
+      return rawId;
+    };
 
     const handleSurfaceRaycast = (clientX: number, clientY: number, isDragging: boolean) => {
       const rect = renderer.domElement.getBoundingClientRect();
@@ -293,12 +347,18 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
 
       raycaster.setFromCamera(_ndcPointer, camera);
       const hits = raycaster.intersectObjects(currentArch.interactableMeshes, false);
+      const now = performance.now();
+
+      let targetFdiId: string | null = null;
+      let sparkOrigin: THREE.Vector3 | null = null;
 
       if (hits.length > 0) {
         const hit = hits[0];
         const hitMesh = hit.object as THREE.Mesh;
-        const fdiId = hitMesh.userData.fdiId as string | undefined;
-        hoveredFdiId = fdiId ?? null;
+        const fdiId = resolvePlayableToothId(hitMesh.userData.fdiId as string | undefined);
+        hoveredFdiId = fdiId;
+        targetFdiId = fdiId;
+        sparkOrigin = hit.point;
 
         if (hit.face) {
           _normalMatrix.getNormalMatrix(hitMesh.matrixWorld);
@@ -307,28 +367,67 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
           _hitNormalWorld.set(0, 0, 1);
         }
 
+        const camRight = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+        const camUp = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
+        const camOut = new THREE.Vector3(0, 0, 1).applyQuaternion(camera.quaternion);
         _brushTargetPos.copy(hit.point).addScaledVector(_hitNormalWorld, 0.03);
-        // Angle brush wand toward upper-right like the reference concept render
         _brushLookAtTarget
           .copy(_brushTargetPos)
-          .addScaledVector(_hitNormalWorld, 0.9)
-          .add(new THREE.Vector3(1.85, 0.62, 0.55));
-        brushActiveUntil = performance.now() + 400;
+          .addScaledVector(camRight, 1.85)
+          .addScaledVector(camUp, 0.65)
+          .addScaledVector(camOut, 0.95);
+        brushActiveUntil = now + 400;
 
-        if (fdiId && sessionRef.current.status === 'playing' && isDragging) {
-          const toothState = sessionRef.current.teeth[fdiId];
+        if (fdiId && isDragging) {
+          const tState = sessionRef.current.teeth[fdiId];
           if (
-            toothState &&
-            toothState.needsVarnish &&
-            !toothState.shielded &&
-            toothState.sector === sessionRef.current.activeSector
+            tState &&
+            tState.needsVarnish &&
+            !tState.shielded &&
+            tState.sector === sessionRef.current.activeSector
           ) {
-            const dx = clientX - lastPointerX;
-            const dy = clientY - lastPointerY;
-            const moveDist = Math.hypot(dx, dy);
-            const scrubDelta = Math.min(0.38, 0.14 + moveDist * 0.0085);
-            onScrubToothRef.current(fdiId, scrubDelta);
-            spawnParticles(hit.point, 5, 0.95);
+            lockedStrokeFdiId = fdiId;
+            lockedStrokeUntil = now + 240;
+          }
+        }
+      } else if (isDragging && lockedStrokeFdiId && now < lockedStrokeUntil) {
+        // Keep the active tooth locked briefly while the user finishes their directional finger swipe across the crown
+        targetFdiId = lockedStrokeFdiId;
+        hoveredFdiId = lockedStrokeFdiId;
+        const lockedNode = currentArch.toothNodes.get(lockedStrokeFdiId);
+        if (lockedNode) {
+          sparkOrigin = lockedNode.surfaceCenterWorld;
+          brushActiveUntil = now + 260;
+        }
+      }
+
+      if (targetFdiId && sessionRef.current.status === 'playing' && isDragging) {
+        const toothState = sessionRef.current.teeth[targetFdiId];
+        if (
+          toothState &&
+          toothState.needsVarnish &&
+          !toothState.shielded &&
+          toothState.sector === sessionRef.current.activeSector
+        ) {
+          const dx = clientX - lastPointerX;
+          const dy = clientY - lastPointerY;
+          const moveDist = Math.hypot(dx, dy);
+
+          const strokeEval = evaluateDirectionalBrushStroke(
+            toothState.requiredDirection,
+            dx,
+            dy,
+          );
+
+          if (strokeEval.isAligned && moveDist >= 1.5) {
+            const scrubDelta = Math.min(
+              0.44,
+              (0.14 + moveDist * 0.011) * strokeEval.alignmentFactor,
+            );
+            onScrubToothRef.current(targetFdiId, scrubDelta);
+            if (sparkOrigin) {
+              spawnParticles(sparkOrigin, 6, 1.05);
+            }
           }
         }
       }
@@ -354,10 +453,12 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
 
     const onPointerUp = () => {
       isPointerDown = false;
+      lockedStrokeFdiId = null;
     };
 
     const clearInputs = () => {
       isPointerDown = false;
+      lockedStrokeFdiId = null;
     };
 
     const domElem = renderer.domElement;
@@ -456,33 +557,20 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
       }
       camera.lookAt(_currentCamLookAt);
 
-      // Determine which tooth the Colgate Red Brush is currently resting on / scrubbing
+      // Hide 3D mouth and brush on the Title screen per user request; show mouth during gameplay/pause/gameover
+      currentArch.archGroup.visible = curSession.status !== 'title';
+      brushGroup.visible = curSession.status === 'playing';
+
       let activeBrushedFdiId: string | null = null;
-      brushGroup.visible = curSession.status === 'playing' || curSession.status === 'title';
+
+      const camRight = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+      const camUp = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
+      const camOut = new THREE.Vector3(0, 0, 1).applyQuaternion(camera.quaternion);
 
       if (nowMs < brushActiveUntil && hoveredFdiId) {
         activeBrushedFdiId = hoveredFdiId;
-      } else if (curSession.status === 'title') {
-        // In Title/Attract view, poise the Colgate Red Brush on `tooth_21` (upper right central incisor)
-        // just like the reference key visual render!
-        const heroNode =
-          currentArch.toothNodes.get('tooth_21') ??
-          currentArch.toothNodes.get('tooth_11') ??
-          currentArch.toothNodes.values().next().value;
-        if (heroNode) {
-          activeBrushedFdiId = heroNode.fdiId;
-          _brushTargetPos
-            .copy(heroNode.surfaceCenterWorld)
-            .addScaledVector(heroNode.surfaceNormalWorld, 0.04);
-          _brushTargetPos.x += Math.sin(elapsed * 3.2) * 0.035;
-          _brushTargetPos.y += 0.05 + Math.cos(elapsed * 4.0) * 0.025;
-          _brushLookAtTarget
-            .copy(_brushTargetPos)
-            .addScaledVector(heroNode.surfaceNormalWorld, 0.85)
-            .add(new THREE.Vector3(1.95, 0.68, 0.55));
-        }
       } else if (curSession.status === 'playing') {
-        // Guide the 3D Red Brush toward the current or next unshielded target tooth in the active sector
+        // Poise the 3D Red Brush gently near the active sector without hiding unbrushed plaque stains
         const activeTarget =
           Object.values(curSession.teeth).find(
             (t) =>
@@ -496,21 +584,37 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
           );
 
         if (activeTarget) {
-          activeBrushedFdiId = activeTarget.fdiId;
           const node = currentArch.toothNodes.get(activeTarget.fdiId);
           if (node) {
-            const scrubOscX = Math.sin(elapsed * 7.5) * 0.045;
-            const scrubOscY = Math.cos(elapsed * 9.0) * 0.035;
+            const sweepPhase = (elapsed * 1.4) % 1.0;
+            const sweepOffset = (sweepPhase - 0.5) * 0.12;
+            let scrubOscRight = 0;
+            let scrubOscUp = 0;
+            switch (activeTarget.requiredDirection) {
+              case 'UP':
+                scrubOscUp = sweepOffset;
+                break;
+              case 'DOWN':
+                scrubOscUp = -sweepOffset;
+                break;
+              case 'LEFT':
+                scrubOscRight = -sweepOffset;
+                break;
+              case 'RIGHT':
+                scrubOscRight = sweepOffset;
+                break;
+            }
             _brushTargetPos
               .copy(node.surfaceCenterWorld)
-              .addScaledVector(node.surfaceNormalWorld, 0.04);
-            _brushTargetPos.x += scrubOscX;
-            _brushTargetPos.y += scrubOscY;
+              .addScaledVector(node.surfaceNormalWorld, 0.16)
+              .addScaledVector(camRight, 0.18 + scrubOscRight)
+              .addScaledVector(camUp, -0.06 + scrubOscUp);
 
             _brushLookAtTarget
               .copy(_brushTargetPos)
-              .addScaledVector(node.surfaceNormalWorld, 0.85)
-              .add(new THREE.Vector3(1.85, 0.64, 0.55));
+              .addScaledVector(camRight, 1.85)
+              .addScaledVector(camUp, 0.64)
+              .addScaledVector(camOut, 0.95);
           }
         }
       }
@@ -522,16 +626,30 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
       brushGroup.position.copy(_brushCurrentPos);
       brushGroup.lookAt(_brushLookAtTarget);
 
-      // Continuous delicate micro-sparkles around the brush contact point (matching reference image)
+      // Continuous delicate micro-sparkles around the brush contact point and across varnished/brushed teeth
       ambientSparkleTimer += dt;
-      if (brushGroup.visible && ambientSparkleTimer >= 0.065) {
+      if (brushGroup.visible && ambientSparkleTimer >= 0.055) {
         ambientSparkleTimer = 0;
-        spawnParticles(_brushCurrentPos, 2, 0.6);
+        spawnParticles(_brushCurrentPos, 2, 0.55);
+
+        // Emit mini-particles over varnished or partially varnished teeth in the active sector
+        const shimmeringTeeth = Object.values(curSession.teeth).filter(
+          (t) =>
+            t.sector === curSession.activeSector &&
+            (t.shielded || (t.needsVarnish && t.coverage > 0.12)),
+        );
+        if (shimmeringTeeth.length > 0) {
+          const pick = shimmeringTeeth[Math.floor(Math.random() * shimmeringTeeth.length)];
+          const tNode = currentArch.toothNodes.get(pick.fdiId);
+          if (tNode) {
+            spawnParticles(tNode.surfaceCenterWorld, pick.shielded ? 2 : 1, 0.45);
+          }
+        }
       }
 
       const isScrubbingNow = nowMs < brushActiveUntil;
-      const tipScale = isScrubbingNow ? 1.12 + Math.sin(elapsed * 28) * 0.1 : 1.0;
-      bristleTipMesh.scale.set(tipScale, tipScale, tipScale * 1.15);
+      const tipScale = isScrubbingNow ? 1.08 + Math.sin(elapsed * 28) * 0.06 : 1.0;
+      activeBristleMesh.scale.set(tipScale, tipScale, tipScale);
 
       syncTeethVisualState(
         currentArch.toothNodes,
@@ -539,6 +657,8 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
         curSession.activeSector,
         elapsed,
         activeBrushedFdiId,
+        camera.quaternion,
+        curSession.status === 'playing',
       );
 
       let anyParticleUpdated = false;
@@ -591,7 +711,9 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
       window.removeEventListener('blur', clearInputs);
 
       currentArch.dispose();
-      disposeBrush();
+      disposeProceduralBrush();
+      disposeGlbBrush?.();
+      dracoLoader.dispose();
       particleGeo.dispose();
       particleMat.dispose();
       contactShadowGeo.dispose();

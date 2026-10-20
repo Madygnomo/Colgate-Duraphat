@@ -525,10 +525,194 @@ const DIRECTION_ANGLE_RAD: Record<BrushDirection, number> = {
   RIGHT: -Math.PI * 0.5,
 };
 
+const DIRECTION_VEC2: Record<BrushDirection, [number, number]> = {
+  UP: [0, 1],
+  DOWN: [0, -1],
+  LEFT: [-1, 0],
+  RIGHT: [1, 0],
+};
+
+export interface EnamelShieldUniforms {
+  uShieldProgress: { value: number };
+  uStrokeDir: { value: THREE.Vector2 };
+  uToothUpSign: { value: number };
+  uTime: { value: number };
+  uSeed: { value: number };
+  uIsBrushed: { value: number };
+  uBrushWorldPos: { value: THREE.Vector3 };
+  uBrushGlowStrength: { value: number };
+}
+
+/**
+ * Creates a physical dental enamel material enhanced with a custom GLSL "Bio-Luminous Fluoride Shield"
+ * shader via `onBeforeCompile`. Uses true 3D surface normals (`N · V` Fresnel silhouette) + gum-clipped
+ * crown coordinates (`aToothCoord`) + real-time 3D brush proximity (`uBrushWorldPos`) + directional
+ * 2-stroke liquid varnish wave (`uShieldProgress`, `uStrokeDir`).
+ */
+function createBioLuminousEnamelMaterial(
+  fdiNumber: number,
+  isUpper: boolean,
+  baseColorMap: THREE.Texture | null = null,
+): { material: THREE.MeshPhysicalMaterial; uniforms: EnamelShieldUniforms } {
+  const uniforms: EnamelShieldUniforms = {
+    uShieldProgress: { value: 0.0 },
+    uStrokeDir: { value: new THREE.Vector2(0, 1) },
+    uToothUpSign: { value: isUpper ? 1.0 : -1.0 },
+    uTime: { value: 0.0 },
+    uSeed: { value: fdiNumber * 1.37 },
+    uIsBrushed: { value: 0.0 },
+    uBrushWorldPos: { value: new THREE.Vector3(0, 0, 10) },
+    uBrushGlowStrength: { value: 0.0 },
+  };
+
+  const material = new THREE.MeshPhysicalMaterial({
+    color: ENAMEL_BASE_COLOR.clone(),
+    map: baseColorMap,
+    vertexColors: true,
+    roughness: 0.16,
+    metalness: 0.02,
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.06,
+    reflectivity: 0.96,
+    emissive: new THREE.Color('#3b2854'),
+    emissiveIntensity: 0.05,
+  });
+
+  material.customProgramCacheKey = () => `duraphat-bio-shield-v2-${baseColorMap ? 'tex' : 'notex'}`;
+
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uShieldProgress = uniforms.uShieldProgress;
+    shader.uniforms.uStrokeDir = uniforms.uStrokeDir;
+    shader.uniforms.uToothUpSign = uniforms.uToothUpSign;
+    shader.uniforms.uTime = uniforms.uTime;
+    shader.uniforms.uSeed = uniforms.uSeed;
+    shader.uniforms.uIsBrushed = uniforms.uIsBrushed;
+    shader.uniforms.uBrushWorldPos = uniforms.uBrushWorldPos;
+    shader.uniforms.uBrushGlowStrength = uniforms.uBrushGlowStrength;
+
+    shader.vertexShader =
+      /* glsl */ `
+      attribute vec3 aToothCoord;
+      varying vec3 vToothCoord;
+      varying vec3 vCustomWorldPos;
+      varying vec3 vCustomWorldNormal;
+      varying vec3 vCustomViewDir;
+      ` +
+      shader.vertexShader.replace(
+        '#include <project_vertex>',
+        /* glsl */ `
+        #include <project_vertex>
+        vToothCoord = aToothCoord;
+        vec4 customWp = modelMatrix * vec4(transformed, 1.0);
+        vCustomWorldPos = customWp.xyz;
+        vCustomWorldNormal = normalize(mat3(modelMatrix) * objectNormal);
+        vCustomViewDir = normalize(cameraPosition - customWp.xyz);
+        `,
+      );
+
+    shader.fragmentShader =
+      /* glsl */ `
+      uniform float uShieldProgress;
+      uniform vec2 uStrokeDir;
+      uniform float uToothUpSign;
+      uniform float uTime;
+      uniform float uSeed;
+      uniform float uIsBrushed;
+      uniform vec3 uBrushWorldPos;
+      uniform float uBrushGlowStrength;
+      varying vec3 vToothCoord;
+      varying vec3 vCustomWorldPos;
+      varying vec3 vCustomWorldNormal;
+      varying vec3 vCustomViewDir;
+      ` +
+      shader.fragmentShader
+        .replace(
+          '#include <map_fragment>',
+          /* glsl */ `
+          #include <map_fragment>
+          // Lift the mid-grey band in Dentadura_Limpia into luminous clinical pearl-white enamel
+          diffuseColor.rgb = mix(diffuseColor.rgb, vec3(1.0, 0.996, 1.0), 0.74);
+          `,
+        )
+        .replace(
+          '#include <dithering_fragment>',
+        /* glsl */ `
+        float nx = vToothCoord.x;
+        float ny = vToothCoord.y; // -1 at biting edge, +1 at visible cervical gumline
+        float labial = vToothCoord.z;
+
+        // Because crownMesh is depth-tested against the 3D gingiva mesh, the hardware Z-buffer
+        // clips the root at the exact 3D gumline intersection with zero gap!
+        float labialMask = smoothstep(-0.18, 0.25, labial);
+
+        // 1. Directional 2-Stroke Liquid Varnish Fill along the required arrow direction
+        vec2 screenToothXY = vec2(clamp(nx, -1.0, 1.0), clamp(ny * uToothUpSign, -1.0, 1.0));
+        float strokeProj01 = clamp(dot(screenToothXY, uStrokeDir) * 0.45 + 0.5, 0.0, 1.0);
+
+        float sweepMask = 0.0;
+        float waveGlow = 0.0;
+        if (uShieldProgress >= 0.99) {
+          sweepMask = 1.0;
+        } else if (uShieldProgress > 0.01) {
+          // Soft liquid varnish transition (no hard line)
+          sweepMask = 1.0 - smoothstep(uShieldProgress - 0.22, uShieldProgress + 0.22, strokeProj01);
+          waveGlow = exp(-pow((strokeProj01 - uShieldProgress) / 0.18, 2.0)) * labialMask;
+        }
+
+        // 2. Smooth Continuous 3D Fresnel Subsurface Glaze & Liquid-Glass Specular Sheen (Zero artificial contour lines)
+        vec3 N = normalize(vCustomWorldNormal);
+        vec3 V = normalize(vCustomViewDir);
+        float ndotv = clamp(dot(N, V), 0.0, 1.0);
+
+        // Monotonic 3D grazing-angle Fresnel: 0 at crown center, smoothly glowing around the 3D tooth curvature
+        float fresnelRim = pow(1.0 - ndotv, 1.95);
+        float deepFresnel = pow(1.0 - ndotv, 3.2);
+
+        // Anisotropic studio specular highlight & slow pearlescent light caustics across the varnished enamel
+        vec3 R = reflect(-V, N);
+        vec3 studioKeyDir = normalize(vec3(0.28, 0.52, 0.81));
+        vec3 studioRimDir = normalize(vec3(-0.42, 0.38, 0.82));
+        float wetSpecular = pow(max(0.0, dot(R, studioKeyDir)), 20.0) + 0.55 * pow(max(0.0, dot(R, studioRimDir)), 14.0);
+        float pearlShimmer = 0.5 + 0.5 * sin(vCustomWorldPos.x * 4.2 + vCustomWorldPos.y * 3.1 - uTime * 2.4 + uSeed);
+
+        float activeShield = sweepMask * labialMask;
+
+        // 3. Real-Time 3D Brush Bristle Contact Illumination on the Enamel Surface
+        float brushDist = distance(vCustomWorldPos, uBrushWorldPos);
+        float brushHalo = exp(-(brushDist * brushDist) / 0.055) * uBrushGlowStrength * labialMask;
+        float brushCore = exp(-(brushDist * brushDist) / 0.015) * uBrushGlowStrength * labialMask;
+
+        vec3 electricViolet = vec3(0.58, 0.28, 0.98);
+        vec3 pearlyLavender = vec3(0.88, 0.78, 1.0);
+        vec3 diamondWhite = vec3(1.0, 0.995, 1.0);
+
+        // Blend continuous pearlescent fluoride glaze into physical enamel
+        vec3 glazeColor = mix(pearlyLavender, electricViolet, 0.38 + 0.42 * fresnelRim);
+        float glazeFactor = clamp((0.18 + 0.56 * fresnelRim + 0.10 * pearlShimmer) * activeShield, 0.0, 0.82);
+
+        gl_FragColor.rgb = mix(gl_FragColor.rgb, glazeColor, glazeFactor);
+        gl_FragColor.rgb = mix(gl_FragColor.rgb, electricViolet, clamp(brushHalo * 0.52 + waveGlow * 0.38, 0.0, 0.75));
+        gl_FragColor.rgb += diamondWhite * (
+          wetSpecular * 0.48 * activeShield +
+          deepFresnel * 0.38 * activeShield +
+          waveGlow * 0.42 +
+          brushCore * 0.68
+        );
+        gl_FragColor.rgb += pearlyLavender * (uIsBrushed * 0.14 * labialMask);
+
+        #include <dithering_fragment>
+        `,
+      );
+  };
+
+  material.userData.shieldUniforms = uniforms;
+  return { material, uniforms };
+}
+
 /**
  * Custom ShaderMaterial for the Directional Brush Stroke Arrow Indicator on each stained tooth.
  * Renders a crisp, animated medical-grade vector arrow + chevron sliding in the required stroke direction
- * (`UP`, `DOWN`, `LEFT`, `RIGHT`) with a radial coverage progress ring.
+ * (`UP`, `DOWN`, `LEFT`, `RIGHT`) with a 2-step radial coverage progress ring.
  */
 function createDirectionalArrowShaderMaterial(): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
@@ -571,7 +755,7 @@ function createDirectionalArrowShaderMaterial(): THREE.ShaderMaterial {
         vec2 q = vec2(c * p.x - s * p.y, s * p.x + c * p.y);
 
         // Smooth animated sliding pulse along +Y (the direction the user must move the brush)
-        float cycle = fract(uTime * 1.15);
+        float cycle = fract(uTime * 1.25);
         float slideY = (cycle - 0.5) * 0.26;
         vec2 qa = vec2(q.x, q.y - slideY);
 
@@ -586,19 +770,19 @@ function createDirectionalArrowShaderMaterial(): THREE.ShaderMaterial {
         float dTrailR = sdSegment(qa, vec2(0.0, -0.06), vec2(0.22, -0.28));
         float dTrail = min(dTrailL, dTrailR);
 
-        // Translucent frosted badge backdrop & outer coverage progress ring so yellow stain remains visible
+        // Translucent frosted badge backdrop & 2-half coverage progress ring (1st move = 50%, 2nd move = 100%)
         float badgeMask = smoothstep(0.82, 0.72, r);
         float ringDist = abs(r - 0.78);
-        float ringMask = smoothstep(0.068, 0.016, ringDist);
+        float ringMask = smoothstep(0.072, 0.016, ringDist);
 
         float angle01 = fract((atan(p.x, p.y) / 6.2831853) + 1.0);
-        float covArc = step(angle01, clamp(uCoverage, 0.06, 1.0));
+        float covArc = step(angle01, clamp(uCoverage, 0.04, 1.0));
 
         float arrowCore = smoothstep(0.098, 0.032, dArrow);
         float arrowGlow = smoothstep(0.22, 0.04, dArrow);
         float trailCore = smoothstep(0.078, 0.025, dTrail) * (1.0 - cycle * 0.5);
 
-        vec3 badgeBg = mix(vec3(0.26, 0.10, 0.52), vec3(0.46, 0.18, 0.88), uCoverage);
+        vec3 badgeBg = mix(vec3(0.26, 0.10, 0.52), vec3(0.48, 0.20, 0.92), uCoverage);
         vec3 ringColor = mix(vec3(0.82, 0.70, 1.0), vec3(0.32, 0.98, 0.74), covArc);
         vec3 strokeColor = vec3(1.0, 1.0, 1.0);
         vec3 glowColor = vec3(0.76, 0.45, 1.0);
@@ -609,7 +793,7 @@ function createDirectionalArrowShaderMaterial(): THREE.ShaderMaterial {
         col = mix(col, strokeColor, clamp(arrowCore + trailCore * 0.78, 0.0, 1.0));
 
         float alpha = clamp(
-          (badgeMask * 0.42 + ringMask * 0.90 + arrowGlow * 0.52 + arrowCore * 0.98 + trailCore * 0.76) * uOpacity,
+          (badgeMask * 0.40 + ringMask * 0.92 + arrowGlow * 0.52 + arrowCore * 0.98 + trailCore * 0.76) * uOpacity,
           0.0,
           1.0
         );
@@ -750,6 +934,7 @@ function buildToothNodeFromGeometry(
   disposableGeometries: THREE.BufferGeometry[],
   disposableMaterials: THREE.Material[],
   gumPositions?: Float32Array | null,
+  baseColorMap: THREE.Texture | null = null,
 ): ToothVisualNode {
   const fdiId = `tooth_${fdiNumber}`;
   toothGeo.computeBoundingBox();
@@ -765,18 +950,12 @@ function buildToothNodeFromGeometry(
     gumPositions,
   );
 
-  // 1. Bright Pearly Wet Ceramic Enamel Crown with Vertex Color Gradation
-  const crownMat = new THREE.MeshPhysicalMaterial({
-    color: ENAMEL_BASE_COLOR.clone(),
-    vertexColors: true,
-    roughness: 0.14,
-    metalness: 0.0,
-    clearcoat: 1.0,
-    clearcoatRoughness: 0.06,
-    reflectivity: 0.95,
-    emissive: new THREE.Color('#3b2854'),
-    emissiveIntensity: 0.08,
-  });
+  // 1. Bright Pearly Wet Ceramic Enamel Crown with Custom GLSL Bio-Luminous Fluoride Shield Shader
+  const { material: crownMat } = createBioLuminousEnamelMaterial(
+    fdiNumber,
+    isUpper,
+    baseColorMap,
+  );
   disposableMaterials.push(crownMat);
 
   const crownMesh = new THREE.Mesh(toothGeo, crownMat);
@@ -790,7 +969,7 @@ function buildToothNodeFromGeometry(
   parentGroup.add(crownMesh);
 
   // 2. Anatomical Labial Plaque Stain Shell
-  const plaqueGeo = createDisplacedShellGeometry(toothGeo, 0.003, outwardNormal, 0.004);
+  const plaqueGeo = createDisplacedShellGeometry(toothGeo, 0.0025, outwardNormal, 0.0035);
   disposableGeometries.push(plaqueGeo);
   const plaqueMat = createToothPlaqueShaderMaterial(fdiNumber * 1.37);
   disposableMaterials.push(plaqueMat);
@@ -800,7 +979,7 @@ function buildToothNodeFromGeometry(
   plaqueMesh.renderOrder = 2;
   parentGroup.add(plaqueMesh);
 
-  // 3. Legacy contour shell disabled — replaced by PBR metalness/roughness varnish glaze + mini-particles
+  // 3. Legacy displaced contour shell remains hidden (shield is rendered natively on crownMesh via GLSL)
   const shieldGeo = new THREE.BufferGeometry();
   disposableGeometries.push(shieldGeo);
   const shieldMat = createFluorideContourShaderMaterial();
@@ -812,16 +991,16 @@ function buildToothNodeFromGeometry(
 
   const surfaceCenterWorld = crownCenter
     .clone()
-    .addScaledVector(outwardNormal, Math.min(0.20, halfD * 0.82));
+    .addScaledVector(outwardNormal, Math.min(0.18, halfD * 0.82));
 
   // 4. Directional Brush Stroke Arrow Indicator floating cleanly on the labial/buccal crown surface
-  const arrowGeo = new THREE.PlaneGeometry(0.25, 0.25);
+  const arrowGeo = new THREE.PlaneGeometry(0.22, 0.22);
   disposableGeometries.push(arrowGeo);
   const arrowMat = createDirectionalArrowShaderMaterial();
   disposableMaterials.push(arrowMat);
 
   const arrowMesh = new THREE.Mesh(arrowGeo, arrowMat);
-  arrowMesh.position.copy(crownCenter).addScaledVector(outwardNormal, halfD + 0.048);
+  arrowMesh.position.copy(crownCenter).addScaledVector(outwardNormal, halfD + 0.044);
   arrowMesh.lookAt(
     arrowMesh.position.x + outwardNormal.x,
     arrowMesh.position.y + outwardNormal.y,
@@ -933,7 +1112,7 @@ export function bindExternalGlbDentalArch(gltfScene: THREE.Group): BuiltDentalAr
   rotBox.getSize(rotSize);
 
   const widthDim = rotSize.x > 0.1 ? rotSize.x : Math.max(rotSize.x, rotSize.y, rotSize.z) || 1;
-  const scaleFactor = 3.95 / widthDim;
+  const scaleFactor = 3.32 / widthDim;
 
   const normMatrix = new THREE.Matrix4()
     .makeScale(scaleFactor, scaleFactor, scaleFactor)
@@ -949,6 +1128,7 @@ export function bindExternalGlbDentalArch(gltfScene: THREE.Group): BuiltDentalAr
     cy: number;
     cz: number;
     explicitFdi: number | null;
+    baseMap: THREE.Texture | null;
   }[] = [];
   const extractedLowerIslands: {
     geo: THREE.BufferGeometry;
@@ -956,6 +1136,7 @@ export function bindExternalGlbDentalArch(gltfScene: THREE.Group): BuiltDentalAr
     cy: number;
     cz: number;
     explicitFdi: number | null;
+    baseMap: THREE.Texture | null;
   }[] = [];
 
   const gumPositionChunks: Float32Array[] = [];
@@ -986,17 +1167,20 @@ export function bindExternalGlbDentalArch(gltfScene: THREE.Group): BuiltDentalAr
     }
 
     const stdMat = mat as THREE.MeshStandardMaterial | undefined;
+    if (stdMat?.map) {
+      stdMat.map.colorSpace = THREE.SRGBColorSpace;
+    }
     const gumMat = new THREE.MeshPhysicalMaterial({
       map: stdMat?.map ?? null,
       bumpMap: stdMat?.normalMap ?? null,
-      bumpScale: 0.006,
-      color: stdMat?.map ? new THREE.Color('#ffe0e6') : new THREE.Color('#f4798e'),
-      roughness: 0.32,
+      bumpScale: 0.005,
+      color: stdMat?.map ? new THREE.Color('#ffffff') : new THREE.Color('#e8758c'),
+      roughness: 0.42,
       metalness: 0.0,
-      clearcoat: 0.55,
-      clearcoatRoughness: 0.22,
-      emissive: new THREE.Color('#66162c'),
-      emissiveIntensity: 0.16,
+      clearcoat: 0.28,
+      clearcoatRoughness: 0.32,
+      emissive: new THREE.Color('#4a1020'),
+      emissiveIntensity: 0.08,
     });
     disposableMaterials.push(gumMat);
 
@@ -1035,6 +1219,11 @@ export function bindExternalGlbDentalArch(gltfScene: THREE.Group): BuiltDentalAr
 
     if (isGum) continue;
 
+    const stdMat = mat as THREE.MeshStandardMaterial | undefined;
+    if (stdMat?.map) {
+      stdMat.map.colorSpace = THREE.SRGBColorSpace;
+    }
+
     const worldToNorm = normMatrix.clone().multiply(mesh.matrixWorld);
     const explicitFdi = parseFdiNumberFromMeshName(mesh.name);
     const islands = explicitFdi
@@ -1064,6 +1253,7 @@ export function bindExternalGlbDentalArch(gltfScene: THREE.Group): BuiltDentalAr
         cy: c.y,
         cz: c.z,
         explicitFdi: islands.length === 1 ? explicitFdi : null,
+        baseMap: stdMat?.map ?? null,
       };
 
       if (isUpperIsland) {
@@ -1099,6 +1289,7 @@ export function bindExternalGlbDentalArch(gltfScene: THREE.Group): BuiltDentalAr
       disposableGeometries,
       disposableMaterials,
       combinedGumPositions,
+      item.baseMap,
     );
     toothNodes.set(node.fdiId, node);
     interactables.push(node.crownMesh);
@@ -1121,26 +1312,30 @@ export function bindExternalGlbDentalArch(gltfScene: THREE.Group): BuiltDentalAr
       disposableGeometries,
       disposableMaterials,
       combinedGumPositions,
+      item.baseMap,
     );
     toothNodes.set(node.fdiId, node);
     interactables.push(node.crownMesh);
   });
 
-  const oralCavityGeo = new THREE.CylinderGeometry(1.34, 1.34, 0.82, 32, 1, false);
-  const oralCavityMat = new THREE.MeshStandardMaterial({
-    color: new THREE.Color('#9e3454'),
-    roughness: 0.75,
-    metalness: 0.0,
-    emissive: new THREE.Color('#4a1224'),
-    emissiveIntensity: 0.35,
-    side: THREE.DoubleSide,
-  });
-  const oralCavityMesh = new THREE.Mesh(oralCavityGeo, oralCavityMat);
-  oralCavityMesh.position.set(0, 0, -0.36);
-  oralCavityMesh.scale.set(1.04, 1, 0.84);
-  archGroup.add(oralCavityMesh);
-  disposableGeometries.push(oralCavityGeo);
-  disposableMaterials.push(oralCavityMat);
+  // Only add an internal oral cavity backdrop when the GLB does not already have separate sculpted upper/lower gums
+  if (gumMeshCount < 2) {
+    const oralCavityGeo = new THREE.CylinderGeometry(1.1, 1.1, 0.68, 32, 1, false);
+    const oralCavityMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#7a223c'),
+      roughness: 0.85,
+      metalness: 0.0,
+      emissive: new THREE.Color('#380c1a'),
+      emissiveIntensity: 0.25,
+      side: THREE.DoubleSide,
+    });
+    const oralCavityMesh = new THREE.Mesh(oralCavityGeo, oralCavityMat);
+    oralCavityMesh.position.set(0, 0, -0.45);
+    oralCavityMesh.scale.set(0.95, 1, 0.75);
+    archGroup.add(oralCavityMesh);
+    disposableGeometries.push(oralCavityGeo);
+    disposableMaterials.push(oralCavityMat);
+  }
 
   const dispose = () => {
     for (const g of disposableGeometries) g.dispose();
@@ -1315,6 +1510,7 @@ export function syncTeethVisualState(
   activeBrushedFdiId?: string | null,
   cameraQuaternion?: THREE.Quaternion,
   isPlaying = false,
+  brushWorldPos?: THREE.Vector3,
 ): void {
   for (const [fdiId, node] of toothNodes.entries()) {
     const fallbackId =
@@ -1331,6 +1527,7 @@ export function syncTeethVisualState(
     const isWisdomMirror = fdiId !== fallbackId;
     const tState = teethState[fdiId] ?? teethState[fallbackId];
     const crownMat = node.crownMesh.material as THREE.MeshPhysicalMaterial;
+    const shieldUniforms = crownMat.userData.shieldUniforms as EnamelShieldUniforms | undefined;
     const plaqueMat = node.plaqueMesh.material as THREE.ShaderMaterial;
     const shieldMat = node.shieldMesh.material as THREE.ShaderMaterial;
     const arrowMat = node.arrowMesh.material as THREE.ShaderMaterial;
@@ -1369,53 +1566,72 @@ export function syncTeethVisualState(
       arrowMat.uniforms.uOpacity.value = 0.0;
     }
 
-    // 3. Aesthetic PBR Fluoride Varnish Material Transformation (metalness, roughness, clearcoat & iridescence)
-    // Purple contour lines are permanently disabled in favor of physical glaze + mini-particles.
+    // 3. Custom GLSL Bio-Luminous Fluoride Shield Shader + PBR Enamel Glaze
     node.shieldMesh.visible = false;
     shieldMat.uniforms.uIntensity.value = 0.0;
+
+    const dirVec = DIRECTION_VEC2[tState.requiredDirection] ?? [0, 1];
+    const shieldProgress = tState.shielded
+      ? 1.0
+      : !isWisdomMirror && tState.needsVarnish && inActiveSector
+        ? cov
+        : 0.0;
+
+    if (shieldUniforms) {
+      shieldUniforms.uShieldProgress.value = shieldProgress;
+      shieldUniforms.uStrokeDir.value.set(dirVec[0], dirVec[1]);
+      shieldUniforms.uTime.value = elapsedSeconds;
+      shieldUniforms.uIsBrushed.value = isActivelyBrushed ? 1.0 : 0.0;
+      if (brushWorldPos) {
+        shieldUniforms.uBrushWorldPos.value.copy(brushWorldPos);
+        shieldUniforms.uBrushGlowStrength.value = isPlaying ? 1.0 : 0.0;
+      } else {
+        shieldUniforms.uBrushGlowStrength.value = 0.0;
+      }
+    }
 
     const shimmerPulse = 0.5 + 0.5 * Math.sin(elapsedSeconds * 3.4 + node.fdiNumber * 0.65);
 
     if (tState.shielded) {
-      // 100% Varnished Tooth: Mirror-gloss fluoride glaze with pearlescent metallic sheen
+      // 100% Protected Tooth: Bio-Luminous Fluoride Glaze + 3D Fresnel Rim Shield
       crownMat.roughness = 0.035;
-      crownMat.metalness = 0.22;
+      crownMat.metalness = 0.18;
       crownMat.clearcoat = 1.0;
       crownMat.clearcoatRoughness = 0.02;
       crownMat.reflectivity = 1.0;
       crownMat.iridescence = 0.65;
       crownMat.iridescenceIOR = 1.45;
       crownMat.emissive.set('#6d3fd6');
-      crownMat.emissiveIntensity = 0.12 + shimmerPulse * 0.06;
+      crownMat.emissiveIntensity = 0.14 + shimmerPulse * 0.06;
     } else if (!isWisdomMirror && tState.needsVarnish && inActiveSector) {
-      // Stained Target Tooth: Transitions from matte/chalky plaque surface to high-gloss metallic glaze as brushed
-      crownMat.roughness = THREE.MathUtils.lerp(0.52, 0.04, cov);
-      crownMat.metalness = THREE.MathUtils.lerp(0.0, 0.22, cov);
-      crownMat.clearcoat = THREE.MathUtils.lerp(0.14, 1.0, cov);
-      crownMat.clearcoatRoughness = THREE.MathUtils.lerp(0.36, 0.02, cov);
-      crownMat.reflectivity = THREE.MathUtils.lerp(0.55, 1.0, cov);
+      // Stained Target Tooth: Transitions from chalky plaque to high-gloss fluoride shield in 2 movements
+      crownMat.roughness = THREE.MathUtils.lerp(0.46, 0.04, cov);
+      crownMat.metalness = THREE.MathUtils.lerp(0.0, 0.18, cov);
+      crownMat.clearcoat = THREE.MathUtils.lerp(0.22, 1.0, cov);
+      crownMat.clearcoatRoughness = THREE.MathUtils.lerp(0.32, 0.02, cov);
+      crownMat.reflectivity = THREE.MathUtils.lerp(0.62, 1.0, cov);
       crownMat.iridescence = THREE.MathUtils.lerp(0.0, 0.65, cov);
       crownMat.iridescenceIOR = 1.45;
       crownMat.emissive.set('#7c3aed');
-      crownMat.emissiveIntensity = isActivelyBrushed ? 0.26 : cov * 0.15;
+      crownMat.emissiveIntensity = isActivelyBrushed ? 0.22 : cov * 0.14;
     } else {
       // Clean Natural Enamel
-      crownMat.roughness = 0.20;
+      crownMat.roughness = 0.16;
       crownMat.metalness = 0.02;
-      crownMat.clearcoat = 0.82;
-      crownMat.clearcoatRoughness = 0.10;
-      crownMat.reflectivity = 0.90;
+      crownMat.clearcoat = 0.90;
+      crownMat.clearcoatRoughness = 0.08;
+      crownMat.reflectivity = 0.92;
       crownMat.iridescence = 0.0;
       crownMat.emissive.set('#3b2854');
-      crownMat.emissiveIntensity = 0.05;
+      crownMat.emissiveIntensity = 0.04;
     }
   }
 }
 
 /**
  * Binds the uploaded `brush_applicator_optimized.glb` model into the existing 3D brush group,
- * normalizing its bristle tip to local (0, 0, 0) and handle along +Z, and applying a two-tone
- * pearly-white bristle tip + glossy Colgate Red handle vertex shading.
+ * normalizing its bristle tip to local (0, 0, 0) and handle along +Z, plumping the teardrop bristle
+ * tuft, and placing the white-to-Colgate-Red transition strictly at the neck ferrule (`z = 0.43..0.46`).
  */
 export function bindExternalGlbBrush(
   gltfScene: THREE.Group,
@@ -1431,6 +1647,12 @@ export function bindExternalGlbBrush(
   if (!sourceMesh) return null;
 
   const foundMesh = sourceMesh as THREE.Mesh;
+  const rawMat = Array.isArray(foundMesh.material) ? foundMesh.material[0] : foundMesh.material;
+  const stdMat = rawMat as THREE.MeshStandardMaterial | undefined;
+  if (stdMat?.map) {
+    stdMat.map.colorSpace = THREE.SRGBColorSpace;
+  }
+
   const geo = foundMesh.geometry.clone();
   geo.applyMatrix4(foundMesh.matrixWorld);
   geo.computeBoundingBox();
@@ -1439,40 +1661,37 @@ export function bindExternalGlbBrush(
   const midZ = (box.min.z + box.max.z) * 0.5;
   const tipY = box.max.y;
 
-  // Move bristle tip (max.y) to origin (0,0,0) and rotate -90deg around X so handle extends along +Z (z in [0, +3.4])
+  // Move bristle tip (max.y) to origin (0,0,0) and rotate -90deg around X so handle extends along +Z
   geo.translate(-midX, -tipY, -midZ);
   geo.rotateX(-Math.PI * 0.5);
-  geo.scale(2.05, 2.05, 2.05);
+  geo.scale(1.85, 1.85, 1.85);
   geo.computeBoundingBox();
   geo.computeVertexNormals();
 
-  // Compute vertex colors: pearly-lavender bristle tuft near z=0..0.32, glossy Colgate Red handle for z>=0.34
-  const pos = geo.attributes.position;
-  const colors = new Float32Array(pos.count * 3);
-  const bristleColor = new THREE.Color('#f7f3ff');
-  const redHandleColor = new THREE.Color('#dc1422');
-  const tmpColor = new THREE.Color();
-
-  for (let i = 0; i < pos.count; i++) {
-    const z = pos.getZ(i);
-    const tHandle = Math.max(0, Math.min(1, (z - 0.28) / 0.10));
-    tmpColor.lerpColors(bristleColor, redHandleColor, tHandle);
-    colors[i * 3] = tmpColor.r;
-    colors[i * 3 + 1] = tmpColor.g;
-    colors[i * 3 + 2] = tmpColor.b;
-  }
-  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-
   const mat = new THREE.MeshPhysicalMaterial({
     color: new THREE.Color('#ffffff'),
-    vertexColors: true,
+    map: stdMat?.map ?? null,
     roughness: 0.18,
-    metalness: 0.04,
-    clearcoat: 1.0,
-    clearcoatRoughness: 0.06,
-    emissive: new THREE.Color('#5a1430'),
-    emissiveIntensity: 0.2,
+    metalness: 0.02,
+    clearcoat: 0.95,
+    clearcoatRoughness: 0.08,
+    emissive: new THREE.Color('#3a0616'),
+    emissiveIntensity: 0.10,
   });
+
+  mat.onBeforeCompile = (shader) => {
+    shader.fragmentShader = shader.fragmentShader.replace(
+      '#include <map_fragment>',
+      /* glsl */ `
+      #include <map_fragment>
+      // Detect red handle pixels vs neutral bristle fiber pixels in tx_brush.webp (in linear color space)
+      float redDominance = clamp((diffuseColor.r - max(diffuseColor.g, diffuseColor.b) - 0.15) * 2.5, 0.0, 1.0);
+      vec3 bristlePearly = mix(diffuseColor.rgb, vec3(0.99, 0.985, 1.0), 0.52);
+      vec3 colgateCrimson = vec3(0.76, 0.010, 0.018);
+      diffuseColor.rgb = mix(bristlePearly, colgateCrimson, redDominance);
+      `,
+    );
+  };
 
   // Remove procedural mesh children from targetBrushGroup while keeping the contact glow Sprite
   const toRemove: THREE.Object3D[] = [];

@@ -5,6 +5,7 @@ import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import {
   CAMERA_PRESETS,
+  COVERAGE_PER_MOVEMENT,
   type DentalSector,
   type GameSessionState,
   evaluateDirectionalBrushStroke,
@@ -204,7 +205,7 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
     gltfLoader.load(
       DEFAULT_MOUTH_GLB_URL,
       (gltf) => {
-        applyLoadedMouthScene(gltf.scene, 'mouth_model_optimized.glb');
+        applyLoadedMouthScene(gltf.scene, 'mouth.glb');
       },
       undefined,
       () => {
@@ -325,9 +326,11 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
     let hoveredFdiId: string | null = null;
     let lockedStrokeFdiId: string | null = null;
     let lockedStrokeUntil = 0;
+    const lastToothMovementAt = new Map<string, number>();
     let cameraTrauma = 0;
     let prevShieldedCount = sessionRef.current.shieldedCount;
     let ambientSparkleTimer = 0;
+    const _projTemp = new THREE.Vector3();
 
     const resolvePlayableToothId = (rawId: string | undefined | null): string | null => {
       if (!rawId) return null;
@@ -336,6 +339,31 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
       if (rawId === 'tooth_38') return 'tooth_37';
       if (rawId === 'tooth_48') return 'tooth_47';
       return rawId;
+    };
+
+    const findNearestActiveStainedTooth = (
+      clientX: number,
+      clientY: number,
+      rect: DOMRect,
+      maxDistPx = 68,
+    ): string | null => {
+      const cur = sessionRef.current;
+      let bestId: string | null = null;
+      let bestDist = maxDistPx;
+      for (const t of Object.values(cur.teeth)) {
+        if (t.sector !== cur.activeSector || !t.needsVarnish || t.shielded) continue;
+        const node = currentArch.toothNodes.get(t.fdiId);
+        if (!node) continue;
+        _projTemp.copy(node.surfaceCenterWorld).project(camera);
+        const sx = rect.left + ((_projTemp.x + 1) * 0.5) * rect.width;
+        const sy = rect.top + ((-_projTemp.y + 1) * 0.5) * rect.height;
+        const d = Math.hypot(clientX - sx, clientY - sy);
+        if (d < bestDist) {
+          bestDist = d;
+          bestId = t.fdiId;
+        }
+      }
+      return bestId;
     };
 
     const handleSurfaceRaycast = (clientX: number, clientY: number, isDragging: boolean) => {
@@ -370,7 +398,7 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
         const camRight = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
         const camUp = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
         const camOut = new THREE.Vector3(0, 0, 1).applyQuaternion(camera.quaternion);
-        _brushTargetPos.copy(hit.point).addScaledVector(_hitNormalWorld, 0.03);
+        _brushTargetPos.copy(hit.point).addScaledVector(_hitNormalWorld, 0.05);
         _brushLookAtTarget
           .copy(_brushTargetPos)
           .addScaledVector(camRight, 1.85)
@@ -387,17 +415,37 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
             tState.sector === sessionRef.current.activeSector
           ) {
             lockedStrokeFdiId = fdiId;
-            lockedStrokeUntil = now + 240;
+            lockedStrokeUntil = now + 380;
+          } else {
+            // If user touched adjacent enamel right next to a stained tooth, magnet-lock to the stained tooth
+            const nearbyStained = findNearestActiveStainedTooth(clientX, clientY, rect, 56);
+            if (nearbyStained) {
+              targetFdiId = nearbyStained;
+              hoveredFdiId = nearbyStained;
+              lockedStrokeFdiId = nearbyStained;
+              lockedStrokeUntil = now + 380;
+            }
           }
         }
-      } else if (isDragging && lockedStrokeFdiId && now < lockedStrokeUntil) {
-        // Keep the active tooth locked briefly while the user finishes their directional finger swipe across the crown
-        targetFdiId = lockedStrokeFdiId;
-        hoveredFdiId = lockedStrokeFdiId;
-        const lockedNode = currentArch.toothNodes.get(lockedStrokeFdiId);
-        if (lockedNode) {
-          sparkOrigin = lockedNode.surfaceCenterWorld;
-          brushActiveUntil = now + 260;
+      } else if (isDragging) {
+        if (lockedStrokeFdiId && now < lockedStrokeUntil) {
+          targetFdiId = lockedStrokeFdiId;
+          hoveredFdiId = lockedStrokeFdiId;
+        } else {
+          const nearbyStained = findNearestActiveStainedTooth(clientX, clientY, rect, 64);
+          if (nearbyStained) {
+            targetFdiId = nearbyStained;
+            hoveredFdiId = nearbyStained;
+            lockedStrokeFdiId = nearbyStained;
+            lockedStrokeUntil = now + 360;
+          }
+        }
+        if (targetFdiId) {
+          const lockedNode = currentArch.toothNodes.get(targetFdiId);
+          if (lockedNode) {
+            sparkOrigin = lockedNode.surfaceCenterWorld;
+            brushActiveUntil = now + 300;
+          }
         }
       }
 
@@ -419,14 +467,17 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
             dy,
           );
 
-          if (strokeEval.isAligned && moveDist >= 1.5) {
-            const scrubDelta = Math.min(
-              0.44,
-              (0.14 + moveDist * 0.011) * strokeEval.alignmentFactor,
-            );
-            onScrubToothRef.current(targetFdiId, scrubDelta);
+          const lastMoveAt = lastToothMovementAt.get(targetFdiId) ?? 0;
+
+          // If the user reverses direction to prepare their 2nd stroke, reset cooldown immediately
+          if (moveDist >= 2.0 && strokeEval.dot < -0.15) {
+            lastToothMovementAt.set(targetFdiId, 0);
+          } else if (strokeEval.isAligned && moveDist >= 1.5 && now - lastMoveAt >= 165) {
+            // Award 1 full directional movement (52% coverage -> 2 movements = 100% Protected!)
+            lastToothMovementAt.set(targetFdiId, now);
+            onScrubToothRef.current(targetFdiId, COVERAGE_PER_MOVEMENT);
             if (sparkOrigin) {
-              spawnParticles(sparkOrigin, 6, 1.05);
+              spawnParticles(sparkOrigin, 10, 1.15);
             }
           }
         }
@@ -440,6 +491,7 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
       isPointerDown = true;
       lastPointerX = e.clientX;
       lastPointerY = e.clientY;
+      lastToothMovementAt.clear();
       handleSurfaceRaycast(e.clientX, e.clientY, true);
     };
 
@@ -454,11 +506,13 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
     const onPointerUp = () => {
       isPointerDown = false;
       lockedStrokeFdiId = null;
+      lastToothMovementAt.clear();
     };
 
     const clearInputs = () => {
       isPointerDown = false;
       lockedStrokeFdiId = null;
+      lastToothMovementAt.clear();
     };
 
     const domElem = renderer.domElement;
@@ -659,6 +713,7 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
         activeBrushedFdiId,
         camera.quaternion,
         curSession.status === 'playing',
+        _brushCurrentPos,
       );
 
       let anyParticleUpdated = false;

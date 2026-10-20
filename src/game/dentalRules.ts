@@ -72,41 +72,41 @@ export const CAMERA_PRESETS: Record<DentalSector | 'ATTRACT' | 'VICTORY', Camera
     sector: 'FRONT',
     labelEs: 'Vista Frontal',
     subtitleEs: 'Arcada Dental Completa',
-    position: [0, 0.05, 9.6],
-    lookAt: [0, -0.02, 0.25],
-    fov: 30,
+    position: [0, 0.04, 9.65],
+    lookAt: [0, -0.02, 0.2],
+    fov: 29,
   },
   FRONT: {
     sector: 'FRONT',
     labelEs: 'Sector Frontal',
     subtitleEs: 'Incisivos y Caninos Anteriores',
-    position: [0, 0.05, 9.45],
-    lookAt: [0, -0.02, 0.3],
-    fov: 30,
+    position: [0, 0.04, 9.5],
+    lookAt: [0, -0.02, 0.25],
+    fov: 29,
   },
   LEFT: {
     sector: 'LEFT',
     labelEs: 'Sector Lateral Izquierdo',
     subtitleEs: 'Premolares y Molares (Cuadrantes 2 y 3)',
-    position: [7.35, 0.18, 5.95],
-    lookAt: [0.85, -0.02, 0.05],
-    fov: 30,
+    position: [7.45, 0.15, 6.05],
+    lookAt: [0.72, -0.02, 0.04],
+    fov: 29,
   },
   RIGHT: {
     sector: 'RIGHT',
     labelEs: 'Sector Lateral Derecho',
     subtitleEs: 'Premolares y Molares (Cuadrantes 1 y 4)',
-    position: [-7.35, 0.18, 5.95],
-    lookAt: [-0.85, -0.02, 0.05],
-    fov: 30,
+    position: [-7.45, 0.15, 6.05],
+    lookAt: [-0.72, -0.02, 0.04],
+    fov: 29,
   },
   VICTORY: {
     sector: 'FRONT',
     labelEs: 'Protección Duraphat 100%',
     subtitleEs: 'Armadura Fluorada Completa (22,600 ppm F)',
-    position: [0, 0.25, 9.8],
-    lookAt: [0, -0.02, 0.25],
-    fov: 31,
+    position: [0, 0.2, 9.85],
+    lookAt: [0, -0.02, 0.2],
+    fov: 30,
   },
 };
 
@@ -202,6 +202,12 @@ export const CLINICAL_FDI_CATALOG: readonly ToothMetadata[] = buildClinicalFdiCa
 export const SPOTS_PER_BATCH = 4;
 
 /**
+ * Each valid directional brush movement awards 52% coverage so every stained tooth
+ * completes cleanly in 2 directional movements (Movement 1 -> 52%, Movement 2 -> 100% Protected).
+ */
+export const COVERAGE_PER_MOVEMENT = 0.52;
+
+/**
  * Evaluates whether a screen-space pointer/finger drag vector (dxScreen, dyScreen)
  * aligns with the tooth's required directional arrow ('UP' | 'DOWN' | 'LEFT' | 'RIGHT').
  * Note: In browser screen coordinates, +X is RIGHT and -Y is UP.
@@ -210,10 +216,10 @@ export function evaluateDirectionalBrushStroke(
   requiredDirection: BrushDirection,
   dxScreen: number,
   dyScreen: number,
-): { isAligned: boolean; alignmentFactor: number } {
+): { isAligned: boolean; alignmentFactor: number; dot: number } {
   const dist = Math.hypot(dxScreen, dyScreen);
   if (dist < 1.2) {
-    return { isAligned: false, alignmentFactor: 0 };
+    return { isAligned: false, alignmentFactor: 0, dot: 0 };
   }
 
   const ux = dxScreen / dist;
@@ -241,15 +247,16 @@ export function evaluateDirectionalBrushStroke(
   }
 
   const dot = ux * tx + uy * ty;
-  // Accept strokes within ~68 degrees (cos(68°) ≈ 0.37) of the arrow direction
-  if (dot >= 0.36) {
+  // Accept strokes within ~72 degrees (cos(72°) ≈ 0.31) of the arrow direction for fluid touch/mouse play
+  if (dot >= 0.30) {
     return {
       isAligned: true,
-      alignmentFactor: Math.min(1.35, 0.72 + dot * 0.63),
+      alignmentFactor: Math.min(1.25, 0.85 + dot * 0.4),
+      dot,
     };
   }
 
-  return { isAligned: false, alignmentFactor: 0 };
+  return { isAligned: false, alignmentFactor: 0, dot };
 }
 
 export function activateNextSectorBatch(

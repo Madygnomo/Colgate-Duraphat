@@ -6,6 +6,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import confetti from 'canvas-confetti';
 import {
+  COVERAGE_PER_MOVEMENT,
   DEFAULT_GAME_DURATION_SEC,
   SECTOR_ORDER,
   type GameSessionState,
@@ -110,8 +111,8 @@ export default function App() {
     });
   }, []);
 
-  // Accessible / Keyboard / Quick-Brush helper for the next unshielded tooth in the active sector
-  const handleBrushNextActiveTarget = useCallback((coverageAmount = 0.36) => {
+  // Accessible / Keyboard / Quick-Brush helper for the next unshielded tooth in the active sector (2 movements = 100%)
+  const handleBrushNextActiveTarget = useCallback((coverageAmount = COVERAGE_PER_MOVEMENT) => {
     setSession((prev) => {
       if (prev.status !== 'playing') return prev;
       const nextTarget = Object.values(prev.teeth).find(
@@ -152,7 +153,7 @@ export default function App() {
 
       if (session.status === 'playing' && (e.key === ' ' || e.key === 'b' || e.key === 'B')) {
         e.preventDefault();
-        handleBrushNextActiveTarget(e.key === ' ' ? 1.0 : 0.38);
+        handleBrushNextActiveTarget(e.key === ' ' ? 1.0 : COVERAGE_PER_MOVEMENT);
         return;
       }
 

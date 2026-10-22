@@ -63,7 +63,7 @@ export interface GameSessionState {
 
 export const SECTOR_ORDER: readonly DentalSector[] = ['FRONT', 'LEFT', 'RIGHT'] as const;
 
-export const DEFAULT_GAME_DURATION_SEC = 45;
+export const DEFAULT_GAME_DURATION_SEC = 30;
 
 export const TARGETS_PER_SECTOR = 4;
 
@@ -202,10 +202,10 @@ export const CLINICAL_FDI_CATALOG: readonly ToothMetadata[] = buildClinicalFdiCa
 export const SPOTS_PER_BATCH = 4;
 
 /**
- * Each valid directional brush movement awards 52% coverage so every stained tooth
- * completes cleanly in 2 directional movements (Movement 1 -> 52%, Movement 2 -> 100% Protected).
+ * Each valid directional brush movement awards 100% coverage so every stained tooth
+ * completes cleanly in 1 directional movement (1 movement -> 100% Protected).
  */
-export const COVERAGE_PER_MOVEMENT = 0.52;
+export const COVERAGE_PER_MOVEMENT = 1.0;
 
 /**
  * Evaluates whether a screen-space pointer/finger drag vector (dxScreen, dyScreen)
@@ -510,8 +510,27 @@ export function applyBrushScrubToTooth(
     } else {
       const timeBonus = Math.round(session.timeRemainingSec * 40);
       score += timeBonus;
-      status = 'gameover';
-      outcome = 'victory';
+      const resetTeeth = createInitialTeethState(SPOTS_PER_BATCH, rng);
+      return {
+        session: {
+          ...session,
+          status: 'title',
+          outcome: 'victory',
+          activeSector: 'FRONT',
+          completedSectors: [],
+          timeRemainingSec: session.totalDurationSec,
+          teeth: resetTeeth,
+          totalTargets: Object.keys(resetTeeth).length,
+          shieldedCount: 0,
+          score,
+          bestScore: Math.max(session.bestScore, score),
+          strokeCombo: 0,
+        },
+        coverageChanged: true,
+        toothJustShielded,
+        sectorJustCompleted,
+        allSectorsCompleted: true,
+      };
     }
   }
 
@@ -544,11 +563,18 @@ export function tickGameTimer(session: GameSessionState, deltaSec: number): Game
 
   const nextTime = Math.max(0, session.timeRemainingSec - deltaSec);
   if (nextTime <= 0) {
+    const resetTeeth = createInitialTeethState(SPOTS_PER_BATCH, Math.random);
     return {
       ...session,
-      timeRemainingSec: 0,
-      status: 'gameover',
+      status: 'title',
       outcome: 'timeout',
+      activeSector: 'FRONT',
+      completedSectors: [],
+      timeRemainingSec: session.totalDurationSec,
+      teeth: resetTeeth,
+      totalTargets: Object.keys(resetTeeth).length,
+      shieldedCount: 0,
+      strokeCombo: 0,
       bestScore: Math.max(session.bestScore, session.score),
     };
   }

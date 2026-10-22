@@ -138,28 +138,29 @@ test('Multi-stroke scrub cleans batches of 4 and auto-advances FRONT -> LEFT -> 
     session = applyBrushScrubToTooth(session, active.fdiId, 1.0).session;
   }
 
-  assert.equal(session.status, 'gameover');
+  assert.equal(session.status, 'title');
   assert.equal(session.outcome, 'victory');
-  assert.equal(session.shieldedCount, 28);
+  assert.equal(session.shieldedCount, 0);
   assert.ok(session.score > 5000);
 });
 
-test('Countdown timer formats as 00:45 / 00:30 and triggers timeout when reaching 0', () => {
+test('Countdown timer formats as 01:00 / 00:45 / 00:30 and returns to Start Menu (title) when reaching 0', () => {
+  assert.equal(formatLedCountdown(60), '01:00');
   assert.equal(formatLedCountdown(45), '00:45');
   assert.equal(formatLedCountdown(30), '00:30');
   assert.equal(formatLedCountdown(9.2), '00:10');
   assert.equal(formatLedCountdown(0), '00:00');
 
   let session: GameSessionState = {
-    ...createInitialGameSession(0, Math.random, 30),
+    ...createInitialGameSession(0, Math.random, 60),
     status: 'playing',
   };
   session = tickGameTimer(session, 12.5);
-  assert.equal(session.timeRemainingSec, 17.5);
+  assert.equal(session.timeRemainingSec, 47.5);
   assert.equal(session.status, 'playing');
 
-  session = tickGameTimer(session, 20);
-  assert.equal(session.timeRemainingSec, 0);
-  assert.equal(session.status, 'gameover');
+  session = tickGameTimer(session, 50);
+  assert.equal(session.timeRemainingSec, 60);
+  assert.equal(session.status, 'title');
   assert.equal(session.outcome, 'timeout');
 });

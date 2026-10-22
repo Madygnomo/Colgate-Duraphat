@@ -13,8 +13,6 @@ import {
   applyBrushScrubToTooth,
   createInitialGameSession,
   formatLedCountdown,
-  getSectorProgress,
-  switchActiveSector,
   tickGameTimer,
 } from './game/dentalRules';
 import { soundEngine } from './audio/soundEngine';
@@ -42,9 +40,9 @@ export default function App() {
     document.body.dataset.state = session.status;
   }, [session.status]);
 
-  // Trigger celebratory confetti and Web Audio fanfare on Victory / Timeout
+  // Trigger celebratory confetti and Web Audio fanfare when a game ends (Victory or Timeout) and returns to Start Menu
   useEffect(() => {
-    if (session.status === 'gameover') {
+    if (session.status === 'title' && session.outcome !== 'none') {
       if (session.outcome === 'victory') {
         soundEngine.playVictoryFanfare();
         try {
@@ -84,6 +82,7 @@ export default function App() {
     setSession((prev) => ({
       ...createInitialGameSession(prev.bestScore, Math.random, DEFAULT_GAME_DURATION_SEC),
       status: 'playing',
+      outcome: 'none',
       modelSource: prev.modelSource,
       customModelName: prev.customModelName,
     }));
@@ -168,11 +167,7 @@ export default function App() {
       }
 
       if (e.key === 'r' || e.key === 'R') {
-        if (
-          session.status === 'playing' ||
-          session.status === 'paused' ||
-          session.status === 'gameover'
-        ) {
+        if (session.status === 'playing' || session.status === 'paused') {
           e.preventDefault();
           handleStartGame();
         }
@@ -210,8 +205,8 @@ export default function App() {
 
   return (
     <main className="relative w-screen h-screen overflow-hidden select-none">
-      {/* 1. Ethereal Pastel Lavender & Guilloché Wave Backdrop */}
-      <GuillocheWaveBackdrop />
+      {/* 1. Recycled Ethereal Pastel Lavender & Guilloché Wave Backdrop (Fondo + Textura) */}
+      <GuillocheWaveBackdrop emphasizeCenterRing={session.status === 'title'} />
 
       {/* 2. Full-Viewport Three.js Studio 3D Dental Arch & Applicator Brush */}
       <DentalViewport3D
@@ -219,16 +214,16 @@ export default function App() {
         onScrubTooth={handleScrubTooth}
       />
 
-      {/* 3. Ultra-Minimalist Key Visual UI Layer (Matching Reference Render 1:1) */}
+      {/* 3. UI Layer: Start Menu ('title') vs. Gameplay HUD ('playing' / 'paused') */}
       <div className="fixed inset-0 z-20 pointer-events-none flex flex-col justify-between p-5 sm:p-8 md:p-10">
-        {/* TOP ROW: Stacked Colgate Duraphat Logo (Left) + Frosted White Timer Pill & Radial Shield Ring (Right) */}
+        {/* TOP ROW: Official Colgate Duraphat Co-Branding Tab (Flush Top-Left) + Frosted White 60s Timer & Radial Shield Ring (Right) */}
         <div className="flex items-start justify-between w-full">
-          {/* Top-Left: Clean Stacked Colgate + Duraphat® Lockup */}
-          <div className="pointer-events-auto">
+          {/* Top-Left: Official Colgate + Duraphat® Co-Branding Tab hanging flush from the top viewport edge */}
+          <div className="pointer-events-auto -mt-5 sm:-mt-8 md:-mt-10">
             <ColgateDuraphatLockup compact />
           </div>
 
-          {/* Top-Right: Frosted White Timer Pill (`00:45`) + Circular Purple Shield Ring (`9%`) */}
+          {/* Top-Right: Frosted White Timer (`01:00`) + Circular Purple Shield Ring */}
           <div className="pointer-events-auto flex items-center gap-3.5 sm:gap-4">
             <button
               type="button"
@@ -314,16 +309,35 @@ export default function App() {
           </div>
         </div>
 
-        {/* CENTER OVERLAY: Centered Start Button on Title Screen, or Pause / Victory / Timeout Modals */}
+        {/* CENTER OVERLAY: Dedicated Start Menu ('title') or Pause Modal ('paused') */}
         <div className="flex-1 flex items-center justify-center my-auto">
           {session.status === 'title' && (
-            <div className="pointer-events-auto flex flex-col items-center justify-center text-center">
+            <div
+              className="pointer-events-auto flex flex-col items-center justify-center text-center max-w-lg w-full px-6 py-8"
+              data-testid="start-menu"
+            >
+              {/* Hero Brand Lockup inside the Guilloché Wave Frame */}
+              <ColgateDuraphatLockup hero className="mb-3.5" />
+
+              <p className="text-xs sm:text-sm font-medium text-[#5E4B8B] tracking-wide mb-7 whitespace-nowrap">
+                Barniz Dental con 5% de Fluoruro de Sodio · 22,600 ppm F
+              </p>
+
+              {/* Show brief outcome message when returning to Start Menu after Victory or Timeout */}
+              {session.outcome !== 'none' && (
+                <p className="text-sm font-semibold text-[#6E48C6] mb-5">
+                  {session.outcome === 'victory'
+                    ? '¡Protección 100% Completa!'
+                    : 'Tiempo finalizado · ¡Vuelve a intentarlo!'}
+                </p>
+              )}
+
               <button
                 type="button"
                 data-start="true"
                 data-testid="start-mission-btn"
                 onClick={handleStartGame}
-                className="px-11 py-4 rounded-2xl bg-white hover:bg-[#FAF8FF] text-[#1E1B3A] font-sans font-bold text-lg sm:text-xl shadow-[0_14px_36px_rgba(109,40,217,0.16)] border border-white flex items-center gap-3 transition-transform active:scale-95 cursor-pointer whitespace-nowrap"
+                className="px-12 py-4 rounded-2xl bg-white hover:bg-[#FAF8FF] text-[#1E1B3A] font-sans font-bold text-lg sm:text-xl shadow-[0_14px_36px_rgba(109,40,217,0.18)] border border-white flex items-center gap-3.5 transition-transform active:scale-95 cursor-pointer whitespace-nowrap"
               >
                 <svg viewBox="0 0 24 24" className="w-5 h-5 fill-[#6E48C6]" aria-hidden="true">
                   <path d="M8 5v14l11-7z" />
@@ -357,86 +371,31 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={handleStartGame}
+                  onClick={() =>
+                    setSession((prev) => ({
+                      ...createInitialGameSession(
+                        prev.bestScore,
+                        Math.random,
+                        DEFAULT_GAME_DURATION_SEC,
+                      ),
+                      status: 'title',
+                      outcome: 'none',
+                      modelSource: prev.modelSource,
+                      customModelName: prev.customModelName,
+                    }))
+                  }
                   className="flex-1 py-3 px-5 rounded-2xl bg-[#F4F0FC] hover:bg-[#EAE2FA] text-[#1E1B3A] font-semibold text-sm cursor-pointer whitespace-nowrap transition-colors"
                 >
-                  Reiniciar
+                  Menú de Inicio
                 </button>
               </div>
             </div>
           )}
-
-          {session.status === 'gameover' && (
-            <div
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="gameover-modal-title"
-              className="pointer-events-auto max-w-sm w-full bg-white/96 p-7 rounded-3xl shadow-[0_20px_50px_rgba(30,27,58,0.14)] border border-white text-center"
-            >
-              <h2
-                id="gameover-modal-title"
-                className="font-sans text-2xl font-bold text-[#1E1B3A] mb-2"
-              >
-                {session.outcome === 'victory'
-                  ? '¡Protección 100% Completa!'
-                  : 'Tiempo Finalizado'}
-              </h2>
-              <p className="text-sm text-[#645A84] mb-6" style={{ fontVariantNumeric: 'tabular-nums' }}>
-                {displayProgressPct}% protegido · {Math.round(session.totalDurationSec - session.timeRemainingSec)}s
-              </p>
-
-              <button
-                type="button"
-                data-start="true"
-                onClick={handleStartGame}
-                className="w-full py-3.5 px-6 rounded-2xl bg-[#1E1B3A] hover:bg-[#2E2956] text-white font-sans font-semibold text-sm shadow-[0_10px_24px_rgba(30,27,58,0.18)] transition-transform active:scale-98 cursor-pointer whitespace-nowrap"
-              >
-                Jugar de Nuevo
-              </button>
-            </div>
-          )}
         </div>
 
-        {/* BOTTOM ROW: Stage Selector (Center during gameplay) + Product Pack (Right) */}
-        <div className="relative flex items-end justify-center w-full min-h-[56px]">
-          <div className="pointer-events-auto">
-            {session.status === 'playing' ? (
-              <div className="bg-white/90 px-2 py-1.5 rounded-2xl shadow-[0_8px_24px_rgba(109,40,217,0.08)] border border-white flex items-center gap-1">
-                {SECTOR_ORDER.map((sector) => {
-                  const stats = getSectorProgress(session.teeth, sector);
-                  const isCurrent = session.activeSector === sector;
-                  const label =
-                    sector === 'FRONT'
-                      ? 'Frontal'
-                      : sector === 'LEFT'
-                        ? 'Izquierdo'
-                        : 'Derecho';
-                  return (
-                    <button
-                      key={sector}
-                      type="button"
-                      data-testid={`sector-indicator-${sector.toLowerCase()}`}
-                      onClick={() => {
-                        setSession((prev) => switchActiveSector(prev, sector));
-                      }}
-                      className={`px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
-                        isCurrent
-                          ? 'bg-[#1E1B3A] text-white'
-                          : stats.isComplete
-                            ? 'text-[#6E48C6] bg-[#F3EEFC]'
-                            : 'text-[#645A84] hover:text-[#1E1B3A]'
-                      }`}
-                    >
-                      {label}
-                    </button>
-                  );
-                })}
-              </div>
-            ) : null}
-          </div>
-
-          {/* Bottom-Right: Official Duraphat 22,600 ppm F Carton Box & Tube */}
-          <div className="hidden sm:block absolute right-0 bottom-0">
+        {/* BOTTOM ROW: Official Duraphat 22,600 ppm F Carton Box & Tube (Right) — No camera view buttons */}
+        <div className="relative flex items-end justify-end w-full min-h-[56px]">
+          <div className="hidden sm:block">
             <DuraphatProductPack />
           </div>
         </div>
@@ -444,4 +403,3 @@ export default function App() {
     </main>
   );
 }
-

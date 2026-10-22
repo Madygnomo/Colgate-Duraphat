@@ -469,15 +469,13 @@ export const DentalViewport3D: React.FC<DentalViewport3DProps> = ({
 
           const lastMoveAt = lastToothMovementAt.get(targetFdiId) ?? 0;
 
-          // If the user reverses direction to prepare their 2nd stroke, reset cooldown immediately
-          if (moveDist >= 2.0 && strokeEval.dot < -0.15) {
-            lastToothMovementAt.set(targetFdiId, 0);
-          } else if (strokeEval.isAligned && moveDist >= 1.5 && now - lastMoveAt >= 165) {
-            // Award 1 full directional movement (52% coverage -> 2 movements = 100% Protected!)
+          if (strokeEval.isAligned && moveDist >= 1.5 && now - lastMoveAt >= 120) {
+            // Award 1 full directional movement (100% coverage -> 1 movement = 100% Protected!)
             lastToothMovementAt.set(targetFdiId, now);
             onScrubToothRef.current(targetFdiId, COVERAGE_PER_MOVEMENT);
+            lockedStrokeFdiId = null;
             if (sparkOrigin) {
-              spawnParticles(sparkOrigin, 10, 1.15);
+              spawnParticles(sparkOrigin, 12, 1.25);
             }
           }
         }

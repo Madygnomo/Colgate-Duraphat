@@ -1671,12 +1671,10 @@ export function bindExternalGlbBrush(
   const mat = new THREE.MeshPhysicalMaterial({
     color: new THREE.Color('#ffffff'),
     map: stdMat?.map ?? null,
-    roughness: 0.18,
+    roughness: 0.24,
     metalness: 0.02,
-    clearcoat: 0.95,
-    clearcoatRoughness: 0.08,
-    emissive: new THREE.Color('#3a0616'),
-    emissiveIntensity: 0.10,
+    clearcoat: 0.72,
+    clearcoatRoughness: 0.14,
   });
 
   mat.onBeforeCompile = (shader) => {
@@ -1685,9 +1683,9 @@ export function bindExternalGlbBrush(
       /* glsl */ `
       #include <map_fragment>
       // Detect red handle pixels vs neutral bristle fiber pixels in tx_brush.webp (in linear color space)
-      float redDominance = clamp((diffuseColor.r - max(diffuseColor.g, diffuseColor.b) - 0.15) * 2.5, 0.0, 1.0);
-      vec3 bristlePearly = mix(diffuseColor.rgb, vec3(0.99, 0.985, 1.0), 0.52);
-      vec3 colgateCrimson = vec3(0.76, 0.010, 0.018);
+      float redDominance = clamp((diffuseColor.r - max(diffuseColor.g, diffuseColor.b) - 0.12) * 3.0, 0.0, 1.0);
+      vec3 bristlePearly = mix(diffuseColor.rgb, vec3(0.99, 0.985, 1.0), 0.55);
+      vec3 colgateCrimson = vec3(0.54, 0.004, 0.012);
       diffuseColor.rgb = mix(bristlePearly, colgateCrimson, redDominance);
       `,
     );
